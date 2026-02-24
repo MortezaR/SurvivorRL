@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 import torch
 import torch.nn as nn
+import copy
 
 @dataclass
 class Config:
@@ -71,6 +72,21 @@ class BareBonesPickerNet(nn.Module):
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         return torch.softmax(self.fc2(x), dim=-1)
+
+    def add_gaussian_noise(model: torch.nn.Module, std: float = 0.01):
+        """
+        Adds in-place Gaussian noise N(0, std^2) to all trainable parameters.
+        """
+        with torch.no_grad():
+            for param in model.parameters():
+                if param.requires_grad:
+                    noise = torch.randn_like(param) * std
+                    param.add_(noise)
+
+    def mutated_copy(model: torch.nn.Module, std: float = 0.01):
+        child = copy.deepcopy(model)
+        add_gaussian_noise(child, std)
+        return child
 
 # ---------------------------
 # Example wiring

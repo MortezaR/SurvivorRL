@@ -15,6 +15,7 @@ pip install -r requirements.txt
 Dependencies are managed in `requirements.txt`:
 
 - `torch`
+- `tqdm`
 
 ## Bare-bones survivor environment
 
@@ -32,4 +33,58 @@ Run with defaults:
 
 ```bash
 python3 bare_bones_survivor_env.py
+```
+
+## Evolution loop (1,000,000 agents)
+
+`bare_bones_survivor_env.py` also supports a large-scale evolutionary loop:
+
+- randomize `1,000,000` agents into `1,000` games of `1,000`
+- run each game
+- clone winners with Gaussian mutation so each game always outputs `1,000` offspring
+- repeat for the configured number of generations
+
+By default, evolution mode now auto-loads and auto-saves population weights at:
+
+- `checkpoints/evolution_population.pt`
+
+If that file does not exist yet, the run starts from random weights and creates it at the end.
+
+Example:
+
+```bash
+python3 bare_bones_survivor_env.py \
+  --mode evolution-loop \
+  --total-agents 1000000 \
+  --agents-per-game 1000 \
+  --num-generations 2 \
+  --num-teams 32 \
+  --max-weeks 18
+```
+
+Save final evolution weights:
+
+```bash
+python3 bare_bones_survivor_env.py \
+  --mode evolution-loop \
+  --num-generations 50 \
+  --save-weights-path checkpoints/evo_weights.pt
+```
+
+Resume from saved weights:
+
+```bash
+python3 bare_bones_survivor_env.py \
+  --mode evolution-loop \
+  --load-weights-path checkpoints/evo_weights.pt \
+  --num-generations 50
+```
+
+Write a checkpoint at every generation (`..._genN.pt`) plus the final file:
+
+```bash
+python3 bare_bones_survivor_env.py \
+  --mode evolution-loop \
+  --save-weights-path checkpoints/evo_weights.pt \
+  --checkpoint-every-generation
 ```

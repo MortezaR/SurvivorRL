@@ -1,86 +1,107 @@
 from __future__ import annotations
 
+import csv
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Tuple
 
 FeatureMatchupRow = Tuple[int, int, float]  # (week_id, team_id, win_prob)
-OpponentMatchupRow = Tuple[int, int, int, float]  # (week_id, team_id, opponent_id, win_prob)
-GameRow = Tuple[int, int, int, float, float]  # (week_id, team_a, team_b, p_a, p_b)
-GameOutcomeRow = Tuple[int, int, int, int]  # (week_id, team_a, team_b, winner_id)
 
 
 @dataclass
-class GeneratedSchedule:
+class CsvSchedule:
     feature_rows: List[FeatureMatchupRow]
-    opponent_rows: List[OpponentMatchupRow]
-    games_by_week: List[List[GameRow]]
+    team_names: List[str]
+    num_weeks: int
+    num_teams: int
 
 
-def build_round_robin_schedule(
+def _normalize_probability(raw_value: str) -> float:
+    """
+    CSV values are percentages (e.g. 64.3) and are clamped to [0, 1].
+    Already-normalized probabilities in [0, 1] are also accepted.
+    """
+    value = float(raw_value) if raw_value else 0.0
+    if value < 0.0 or value > 1.0:
+        value /= 100.0
+    return max(0.0, min(1.0, value))
+
+
+def load_schedule_from_csv(
+    csv_path: str | Path,
     num_weeks: int,
     num_teams: int,
-) -> GeneratedSchedule:
+) -> CsvSchedule:
     """
-    Build weekly team-vs-team matchups with per-game complementary odds.
+    Load a team-week schedule from CSV into feature rows for featurization.
     """
-    rng = random.Random()
-    teams = list(range(num_teams))
+    if num_weeks <= 0:
+        raise ValueError("num_weeks must be > 0")
+    if num_teams <= 0:
+        raise ValueError("num_teams must be > 0")
 
-    feature_rows: List[FeatureMatchupRow] = []
-    opponent_rows: List[OpponentMatchupRow] = []
-    games_by_week: List[List[GameRow]] = []
+    path = Path(csv_path)
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            raise ValueError(f"CSV has no header: {path}")
+        if "Team" not in reader.fieldnames:
+            raise ValueError(f"CSV must include a 'Team' column: {path}")
 
-    for week_id in range(num_weeks):
-        week_games: List[GameRow] = []
-        for i in range(num_teams // 2):
-            team_a = teams[i]
-            team_b = teams[-(i + 1)]
+        week_columns = [str(week_id + 1) for week_id in range(num_weeks)]
+        missing_columns = [col for col in week_columns if col not in reader.fieldnames]
+        if missing_columns:
+            raise ValueError(
+                f"CSV is missing required week columns {missing_columns} in {path}"
+            )
 
-            p_a = rng.random()
-            p_b = 1.0 - p_a
+        feature_rows: List[FeatureMatchupRow] = []
+        team_names: List[str] = []
 
-            week_games.append((week_id, team_a, team_b, p_a, p_b))
+        for team_id, row in enumerate(reader):
+            if team_id >= num_teams:
+                break
+            team_name = (row.get("Team") or "").strip() or f"Team{team_id}"
+            team_names.append(team_name)
+            for week_id, column_name in enumerate(week_columns):
+                win_prob = _normalize_probability((row.get(column_name) or "").strip())
+                feature_rows.append((week_id, team_id, win_prob))
 
-            feature_rows.append((week_id, team_a, p_a))
-            feature_rows.append((week_id, team_b, p_b))
+    if len(team_names) < num_teams:
+        raise ValueError(
+            f"CSV only had {len(team_names)} teams, but num_teams={num_teams} was requested."
+        )
 
-            opponent_rows.append((week_id, team_a, team_b, p_a))
-            opponent_rows.append((week_id, team_b, team_a, p_b))
-
-        games_by_week.append(week_games)
-        teams = [teams[0], teams[-1], *teams[1:-1]]
-
-    return GeneratedSchedule(
+    return CsvSchedule(
         feature_rows=feature_rows,
-        opponent_rows=opponent_rows,
-        games_by_week=games_by_week,
+        team_names=team_names,
+        num_weeks=num_weeks,
+        num_teams=num_teams,
     )
 
 
-def sample_game_outcomes(
-    games_by_week: List[List[GameRow]],
-) -> List[List[GameOutcomeRow]]:
-    """
-    Pick one winner per game, outside the environment.
-    """
-    rng = random.Random()
-    outcomes_by_week: List[List[GameOutcomeRow]] = []
-
-    for week_games in games_by_week:
-        week_outcomes: List[GameOutcomeRow] = []
-        for week_id, team_a, team_b, p_a, p_b in week_games:
-            winner_id = rng.choices([team_a, team_b], weights=[p_a, p_b], k=1)[0]
-            week_outcomes.append((week_id, team_a, team_b, winner_id))
-        outcomes_by_week.append(week_outcomes)
-
-    return outcomes_by_week
-
-
-def extract_weekly_winners(
-    outcomes_by_week: List[List[GameOutcomeRow]],
+def sample_weekly_winners(
+    matchup_table: List[FeatureMatchupRow],
+    num_weeks: int,
+    num_teams: int,
 ) -> List[List[int]]:
+    """
+    Sample winners from per-team weekly probabilities.
+    Each team's weekly outcome is sampled independently.
+    """
+    weekly_probs: List[List[float]] = [[0.0 for _ in range(num_teams)] for _ in range(num_weeks)]
+    for week_id, team_id, win_prob in matchup_table:
+        if 0 <= week_id < num_weeks and 0 <= team_id < num_teams:
+            weekly_probs[week_id][team_id] = max(0.0, min(1.0, float(win_prob)))
+
+    rng = random.Random()
     winners_by_week: List[List[int]] = []
-    for week_outcomes in outcomes_by_week:
-        winners_by_week.append([winner_id for _, _, _, winner_id in week_outcomes])
+    for week_id in range(num_weeks):
+        week_winners: List[int] = []
+        for team_id, win_prob in enumerate(weekly_probs[week_id]):
+            if win_prob > 0.0 and rng.random() < win_prob:
+                week_winners.append(team_id)
+        winners_by_week.append(week_winners)
+
     return winners_by_week

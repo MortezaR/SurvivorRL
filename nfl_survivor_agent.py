@@ -78,11 +78,13 @@ class BareBonesPickerNet(nn.Module):
         super().__init__()
         self.agent_id = agent_id
         self.fc1 = nn.Linear(input_dim, 128)
-        self.fc2 = nn.Linear(128, num_teams)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, num_teams)
 
     def forward(self, x, unavailable_team_ids: Optional[List[int]] = None):
         x = torch.relu(self.fc1(x))
-        logits = self.fc2(x)
+        x = torch.relu(self.fc2(x))
+        logits = self.fc3(x)
         if unavailable_team_ids:
             blocked = [tid for tid in unavailable_team_ids if 0 <= tid < logits.shape[-1]]
             if blocked and len(blocked) < logits.shape[-1]:

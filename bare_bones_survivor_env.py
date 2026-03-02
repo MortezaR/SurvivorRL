@@ -15,13 +15,12 @@ from nfl_survivor_agent import (
 )
 from survivor_schedule import (
     FeatureMatchupRow,
-    GameRow,
-    build_round_robin_schedule,
-    extract_weekly_winners,
-    sample_game_outcomes,
+    load_schedule_from_csv,
+    sample_weekly_winners,
 )
 
 DEFAULT_EVOLUTION_WEIGHTS_PATH = "checkpoints/evolution_population.pt"
+DEFAULT_SCHEDULE_CSV_PATH = "cleaned_grid2.csv"
 
 
 @dataclass
@@ -44,6 +43,7 @@ class EvolutionLoopConfig:
     load_weights_path: Optional[str] = DEFAULT_EVOLUTION_WEIGHTS_PATH
     save_weights_path: Optional[str] = DEFAULT_EVOLUTION_WEIGHTS_PATH
     checkpoint_every_generation: bool = False
+    schedule_csv_path: str = DEFAULT_SCHEDULE_CSV_PATH
 
 
 @dataclass
@@ -168,18 +168,11 @@ def _matchup_rows_to_weekly_odds(
 
 
 def _sample_winner_masks(
-    games_by_week: List[List[GameRow]],
-    num_weeks: int,
-    num_teams: int,
+    weekly_odds: torch.Tensor,
     rng: torch.Generator,
 ) -> torch.Tensor:
-    winner_masks = torch.zeros((num_weeks, num_teams), dtype=torch.bool)
-    for week_id in range(min(num_weeks, len(games_by_week))):
-        for _, team_a, team_b, p_a, _ in games_by_week[week_id]:
-            draw = torch.rand((), generator=rng).item()
-            winner_team = team_a if draw < p_a else team_b
-            winner_masks[week_id, winner_team] = True
-    return winner_masks
+    draws = torch.rand(weekly_odds.shape, generator=rng)
+    return draws < weekly_odds.clamp(min=0.0, max=1.0)
 
 
 def _play_survivor_game_with_population(
@@ -268,6 +261,7 @@ def _save_evolution_weights(
         "mutation_std": cfg.mutation_std,
         "odds_weight": cfg.odds_weight,
         "seed": cfg.seed,
+        "schedule_csv_path": cfg.schedule_csv_path,
     }
     torch.save(payload, checkpoint_path)
 
@@ -310,7 +304,8 @@ def run_evolution_loop(cfg: EvolutionLoopConfig) -> None:
     num_games = cfg.total_agents // cfg.agents_per_game
     rng = torch.Generator().manual_seed(cfg.seed)
 
-    schedule = build_round_robin_schedule(
+    schedule = load_schedule_from_csv(
+        csv_path=cfg.schedule_csv_path,
         num_weeks=cfg.max_weeks,
         num_teams=cfg.num_teams,
     )
@@ -359,9 +354,7 @@ def run_evolution_loop(cfg: EvolutionLoopConfig) -> None:
             game_population = shuffled[start:end]
 
             winner_masks = _sample_winner_masks(
-                games_by_week=schedule.games_by_week,
-                num_weeks=cfg.max_weeks,
-                num_teams=cfg.num_teams,
+                weekly_odds=weekly_odds,
                 rng=rng,
             )
             winner_rows = _play_survivor_game_with_population(
@@ -439,6 +432,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--load-weights-path", type=str, default=DEFAULT_EVOLUTION_WEIGHTS_PATH)
     parser.add_argument("--save-weights-path", type=str, default=DEFAULT_EVOLUTION_WEIGHTS_PATH)
     parser.add_argument("--checkpoint-every-generation", action="store_true")
+    parser.add_argument("--schedule-csv-path", type=str, default=DEFAULT_SCHEDULE_CSV_PATH)
     return parser
 
 
@@ -458,6 +452,7 @@ def main() -> None:
             load_weights_path=args.load_weights_path,
             save_weights_path=args.save_weights_path,
             checkpoint_every_generation=args.checkpoint_every_generation,
+            schedule_csv_path=args.schedule_csv_path,
         )
         run_evolution_loop(loop_cfg)
         return
@@ -468,13 +463,17 @@ def main() -> None:
         max_weeks=args.max_weeks,
     )
 
-    # Matchups and game winners are generated outside the environment.
-    schedule = build_round_robin_schedule(
+    # Matchups and game winners are loaded and sampled from CSV outside the environment.
+    schedule = load_schedule_from_csv(
+        csv_path=args.schedule_csv_path,
         num_weeks=cfg.max_weeks,
         num_teams=cfg.num_teams,
     )
-    outcomes_by_week = sample_game_outcomes(schedule.games_by_week)
-    winning_teams_by_week = extract_weekly_winners(outcomes_by_week)
+    winning_teams_by_week = sample_weekly_winners(
+        matchup_table=schedule.feature_rows,
+        num_weeks=cfg.max_weeks,
+        num_teams=cfg.num_teams,
+    )
 
     env = SurvivorEnvironment(cfg)
     result = env.play_game(

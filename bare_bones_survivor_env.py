@@ -23,6 +23,10 @@ DEFAULT_EVOLUTION_WEIGHTS_PATH = "checkpoints/evolution_population.pt"
 DEFAULT_SCHEDULE_CSV_PATH = "cleaned_grid2.csv"
 
 
+def _runtime_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 @dataclass
 class SurvivorConfig:
     num_agents: int = 1_000
@@ -59,6 +63,7 @@ class SurvivorGameResult:
 class SurvivorEnvironment:
     def __init__(self, cfg: SurvivorConfig) -> None:
         self.cfg = cfg
+        self.device = _runtime_device()
 
         self.feature_cfg = AgentFeatureConfig(
             max_contestants=cfg.num_agents,
@@ -79,6 +84,7 @@ class SurvivorEnvironment:
             for agent_id in range(cfg.num_agents)
         ]
         for model in self.agents:
+            model.to(self.device)
             model.eval()
 
     def play_game(
@@ -121,7 +127,7 @@ class SurvivorEnvironment:
                         matchup_table=matchup_rows_seen,
                         agent_id=agent_id,
                         current_week=week_id,
-                    )
+                    ).to(self.device)
                     pick_probs = self.agents[agent_id](
                         x,
                         unavailable_team_ids=list(prior_picks),
@@ -159,8 +165,9 @@ def _matchup_rows_to_weekly_odds(
     matchup_table: List[FeatureMatchupRow],
     num_weeks: int,
     num_teams: int,
+    device: torch.device,
 ) -> torch.Tensor:
-    weekly_odds = torch.zeros((num_weeks, num_teams), dtype=torch.float32)
+    weekly_odds = torch.zeros((num_weeks, num_teams), dtype=torch.float32, device=device)
     for week_id, team_id, win_prob in matchup_table:
         if 0 <= week_id < num_weeks and 0 <= team_id < num_teams:
             weekly_odds[week_id, team_id] = float(win_prob)
@@ -169,9 +176,8 @@ def _matchup_rows_to_weekly_odds(
 
 def _sample_winner_masks(
     weekly_odds: torch.Tensor,
-    rng: torch.Generator,
 ) -> torch.Tensor:
-    draws = torch.rand(weekly_odds.shape, generator=rng)
+    draws = torch.rand(weekly_odds.shape, device=weekly_odds.device)
     return draws < weekly_odds.clamp(min=0.0, max=1.0)
 
 
@@ -179,14 +185,15 @@ def _play_survivor_game_with_population(
     game_population: torch.Tensor,
     weekly_log_odds: torch.Tensor,
     winner_masks_by_week: torch.Tensor,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, int]:
     """
     Lightweight survivor simulation for one game population.
-    Returns winner row indices into `game_population`.
+    Returns winner row indices into `game_population` and number of played weeks.
     """
     game_size, num_teams = game_population.shape
-    picks_used = torch.zeros((game_size, num_teams), dtype=torch.bool)
-    alive = torch.ones((game_size,), dtype=torch.bool)
+    picks_used = torch.zeros((game_size, num_teams), dtype=torch.bool, device=game_population.device)
+    alive = torch.ones((game_size,), dtype=torch.bool, device=game_population.device)
+    weeks_played = 0
 
     for week_id in range(weekly_log_odds.shape[0]):
         alive_ids = alive.nonzero(as_tuple=False).flatten()
@@ -199,40 +206,45 @@ def _play_survivor_game_with_population(
         pick_probs = torch.softmax(logits, dim=1)
         picks = torch.multinomial(pick_probs, num_samples=1).squeeze(1)
         picks_used[alive_ids, picks] = True
+        weeks_played = week_id + 1
 
         survived = winner_masks_by_week[week_id, picks]
         if not bool(survived.any()):
             # If everyone dies in the final played round, co-winners are round entrants.
-            return round_start_alive
+            return round_start_alive, weeks_played
 
         alive[:] = False
         alive[alive_ids[survived]] = True
 
-    return alive.nonzero(as_tuple=False).flatten()
+    return alive.nonzero(as_tuple=False).flatten(), weeks_played
 
 
 def _clone_winners_to_game_size(
     winners: torch.Tensor,
     game_size: int,
     mutation_std: float,
-    rng: torch.Generator,
 ) -> torch.Tensor:
     num_winners = int(winners.shape[0])
     if num_winners == 0:
         raise ValueError("Cannot clone from an empty winner set.")
 
     base_children = game_size // num_winners
-    counts = torch.full((num_winners,), base_children, dtype=torch.long)
+    counts = torch.full(
+        (num_winners,),
+        base_children,
+        dtype=torch.long,
+        device=winners.device,
+    )
     remainder = game_size - int(counts.sum().item())
     if remainder > 0:
-        bonus_ids = torch.randperm(num_winners, generator=rng)[:remainder]
+        bonus_ids = torch.randperm(num_winners, device=winners.device)[:remainder]
         counts[bonus_ids] += 1
 
     offspring = winners.repeat_interleave(counts, dim=0)
     mutation_noise = torch.randn(
         offspring.shape,
-        generator=rng,
         dtype=offspring.dtype,
+        device=offspring.device,
     ) * mutation_std
     return offspring + mutation_noise
 
@@ -302,7 +314,10 @@ def run_evolution_loop(cfg: EvolutionLoopConfig) -> None:
         raise ValueError("--max-weeks must be > 0")
 
     num_games = cfg.total_agents // cfg.agents_per_game
-    rng = torch.Generator().manual_seed(cfg.seed)
+    device = _runtime_device()
+    torch.manual_seed(cfg.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(cfg.seed)
 
     schedule = load_schedule_from_csv(
         csv_path=cfg.schedule_csv_path,
@@ -313,12 +328,13 @@ def run_evolution_loop(cfg: EvolutionLoopConfig) -> None:
         matchup_table=schedule.feature_rows,
         num_weeks=cfg.max_weeks,
         num_teams=cfg.num_teams,
+        device=device,
     )
     weekly_log_odds = torch.log(weekly_odds.clamp_min(1e-6)) * cfg.odds_weight
 
     # Each agent is a compact genome: one learnable preference score per team.
     if cfg.load_weights_path and Path(cfg.load_weights_path).exists():
-        population = _load_evolution_weights(cfg.load_weights_path, cfg=cfg)
+        population = _load_evolution_weights(cfg.load_weights_path, cfg=cfg).to(device=device)
         print(f"Loaded evolution weights from: {cfg.load_weights_path}")
     else:
         if cfg.load_weights_path:
@@ -326,11 +342,12 @@ def run_evolution_loop(cfg: EvolutionLoopConfig) -> None:
                 f"No saved weights found at {cfg.load_weights_path}. "
                 "Starting from random initialization."
             )
-        population = torch.randn((cfg.total_agents, cfg.num_teams), generator=rng)
+        population = torch.randn((cfg.total_agents, cfg.num_teams), device=device)
 
     print(
         "Starting loop: "
-        f"{cfg.total_agents} agents -> {num_games} games x {cfg.agents_per_game} agents/game"
+        f"{cfg.total_agents} agents -> {num_games} games x {cfg.agents_per_game} agents/game "
+        f"on {device.type}"
     )
     generation_iter = tqdm(
         range(cfg.num_generations),
@@ -338,9 +355,10 @@ def run_evolution_loop(cfg: EvolutionLoopConfig) -> None:
         unit="gen",
     )
     for generation_id in generation_iter:
-        shuffled = population[torch.randperm(cfg.total_agents, generator=rng)]
+        shuffled = population[torch.randperm(cfg.total_agents, device=device)]
         next_population = torch.empty_like(shuffled)
         winners_per_game: List[int] = []
+        weeks_ended_per_game: List[int] = []
 
         game_iter = tqdm(
             range(num_games),
@@ -355,35 +373,36 @@ def run_evolution_loop(cfg: EvolutionLoopConfig) -> None:
 
             winner_masks = _sample_winner_masks(
                 weekly_odds=weekly_odds,
-                rng=rng,
             )
-            winner_rows = _play_survivor_game_with_population(
+            winner_rows, weeks_played = _play_survivor_game_with_population(
                 game_population=game_population,
                 weekly_log_odds=weekly_log_odds,
                 winner_masks_by_week=winner_masks,
             )
             winners_per_game.append(int(winner_rows.numel()))
+            weeks_ended_per_game.append(weeks_played)
 
             offspring = _clone_winners_to_game_size(
                 winners=game_population[winner_rows],
                 game_size=cfg.agents_per_game,
                 mutation_std=cfg.mutation_std,
-                rng=rng,
             )
             next_population[start:end] = offspring
 
         population = next_population
         avg_winners = sum(winners_per_game) / len(winners_per_game)
+        avg_week_game_ended = sum(weeks_ended_per_game) / len(weeks_ended_per_game)
         generation_summary = (
             f"Generation {generation_id + 1}/{cfg.num_generations}: "
             f"avg winners/game={avg_winners:.2f}, "
-            f"min={min(winners_per_game)}, max={max(winners_per_game)}, "
+            f"avg week game ended={avg_week_game_ended:.2f}, "
+            f"max={max(winners_per_game)}, "
             f"new_agents={population.shape[0]}"
         )
         tqdm.write(generation_summary)
         generation_iter.set_postfix(
             avg_winners=f"{avg_winners:.2f}",
-            min_winners=min(winners_per_game),
+            avg_week_ended=f"{avg_week_game_ended:.2f}",
             max_winners=max(winners_per_game),
         )
         if cfg.checkpoint_every_generation and cfg.save_weights_path:
@@ -476,6 +495,7 @@ def main() -> None:
     )
 
     env = SurvivorEnvironment(cfg)
+    print(f"Running single game on {env.device.type}")
     result = env.play_game(
         matchup_table=schedule.feature_rows,
         winning_teams_by_week=winning_teams_by_week,

@@ -176,71 +176,101 @@ def _matchup_rows_to_weekly_odds(
 
 def _sample_winner_masks(
     weekly_odds: torch.Tensor,
+    num_games: int,
 ) -> torch.Tensor:
-    draws = torch.rand(weekly_odds.shape, device=weekly_odds.device)
-    return draws < weekly_odds.clamp(min=0.0, max=1.0)
+    draws = torch.rand(
+        (num_games, weekly_odds.shape[0], weekly_odds.shape[1]),
+        device=weekly_odds.device,
+    )
+    return draws < weekly_odds.unsqueeze(0).clamp(min=0.0, max=1.0)
 
 
-def _play_survivor_game_with_population(
-    game_population: torch.Tensor,
+def _play_survivor_games_with_population(
+    game_populations: torch.Tensor,
     weekly_log_odds: torch.Tensor,
-    winner_masks_by_week: torch.Tensor,
-) -> tuple[torch.Tensor, int]:
+    winner_masks_by_game_week: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Lightweight survivor simulation for one game population.
-    Returns winner row indices into `game_population` and number of played weeks.
+    Batched survivor simulation for all games.
+    Returns winner masks [num_games, agents_per_game] and weeks played [num_games].
     """
-    game_size, num_teams = game_population.shape
-    picks_used = torch.zeros((game_size, num_teams), dtype=torch.bool, device=game_population.device)
-    alive = torch.ones((game_size,), dtype=torch.bool, device=game_population.device)
-    weeks_played = 0
+    num_games, game_size, num_teams = game_populations.shape
+    picks_used = torch.zeros(
+        (num_games, game_size, num_teams),
+        dtype=torch.bool,
+        device=game_populations.device,
+    )
+    alive = torch.ones(
+        (num_games, game_size),
+        dtype=torch.bool,
+        device=game_populations.device,
+    )
+    weeks_played = torch.zeros(
+        (num_games,),
+        dtype=torch.int64,
+        device=game_populations.device,
+    )
 
     for week_id in range(weekly_log_odds.shape[0]):
-        alive_ids = alive.nonzero(as_tuple=False).flatten()
-        if alive_ids.numel() <= 1:
+        alive_counts = alive.sum(dim=1)
+        active_games = alive_counts > 1
+        if not bool(active_games.any()):
             break
-        round_start_alive = alive_ids
+        round_start_alive = alive.clone()
 
-        logits = game_population[alive_ids] + weekly_log_odds[week_id].unsqueeze(0)
-        logits = logits.masked_fill(picks_used[alive_ids], -1e9)
+        active_alive = alive & active_games.unsqueeze(1)
+        active_alive_ids = active_alive.nonzero(as_tuple=False)
+        logits = (
+            game_populations[active_alive_ids[:, 0], active_alive_ids[:, 1]]
+            + weekly_log_odds[week_id].unsqueeze(0)
+        )
+        logits = logits.masked_fill(
+            picks_used[active_alive_ids[:, 0], active_alive_ids[:, 1]],
+            -1e9,
+        )
         pick_probs = torch.softmax(logits, dim=1)
         picks = torch.multinomial(pick_probs, num_samples=1).squeeze(1)
-        picks_used[alive_ids, picks] = True
-        weeks_played = week_id + 1
 
-        survived = winner_masks_by_week[week_id, picks]
-        if not bool(survived.any()):
+        picks_used[active_alive_ids[:, 0], active_alive_ids[:, 1], picks] = True
+        survived = winner_masks_by_game_week[active_alive_ids[:, 0], week_id, picks]
+
+        next_alive = alive.clone()
+        next_alive[active_games] = False
+        next_alive[active_alive_ids[:, 0], active_alive_ids[:, 1]] = survived
+
+        surviving_counts = next_alive.sum(dim=1)
+        zero_survivors = active_games & (surviving_counts == 0)
+        if bool(zero_survivors.any()):
             # If everyone dies in the final played round, co-winners are round entrants.
-            return round_start_alive, weeks_played
+            next_alive[zero_survivors] = round_start_alive[zero_survivors]
 
-        alive[:] = False
-        alive[alive_ids[survived]] = True
+        alive = next_alive
+        weeks_played[active_games] = week_id + 1
 
-    return alive.nonzero(as_tuple=False).flatten(), weeks_played
+    return alive, weeks_played
 
 
 def _clone_winners_to_game_size(
-    winners: torch.Tensor,
-    game_size: int,
+    game_populations: torch.Tensor,
+    winner_masks: torch.Tensor,
     mutation_std: float,
 ) -> torch.Tensor:
-    num_winners = int(winners.shape[0])
-    if num_winners == 0:
+    """
+    Sample winners with replacement to refill each game to full size.
+    """
+    winner_counts = winner_masks.sum(dim=1)
+    if bool((winner_counts == 0).any()):
         raise ValueError("Cannot clone from an empty winner set.")
 
-    base_children = game_size // num_winners
-    counts = torch.full(
-        (num_winners,),
-        base_children,
-        dtype=torch.long,
-        device=winners.device,
+    sampling_weights = winner_masks.to(dtype=torch.float32)
+    game_size = game_populations.shape[1]
+    parent_rows = torch.multinomial(
+        sampling_weights,
+        num_samples=game_size,
+        replacement=True,
     )
-    remainder = game_size - int(counts.sum().item())
-    if remainder > 0:
-        bonus_ids = torch.randperm(num_winners, device=winners.device)[:remainder]
-        counts[bonus_ids] += 1
-
-    offspring = winners.repeat_interleave(counts, dim=0)
+    gather_ids = parent_rows.unsqueeze(-1).expand(-1, -1, game_populations.shape[2])
+    offspring = torch.gather(game_populations, dim=1, index=gather_ids)
     mutation_noise = torch.randn(
         offspring.shape,
         dtype=offspring.dtype,
@@ -356,54 +386,40 @@ def run_evolution_loop(cfg: EvolutionLoopConfig) -> None:
     )
     for generation_id in generation_iter:
         shuffled = population[torch.randperm(cfg.total_agents, device=device)]
-        next_population = torch.empty_like(shuffled)
-        winners_per_game: List[int] = []
-        weeks_ended_per_game: List[int] = []
-
-        game_iter = tqdm(
-            range(num_games),
-            desc=f"Generation {generation_id + 1}/{cfg.num_generations} games",
-            unit="game",
-            leave=False,
+        game_populations = shuffled.view(num_games, cfg.agents_per_game, cfg.num_teams)
+        winner_masks = _sample_winner_masks(
+            weekly_odds=weekly_odds,
+            num_games=num_games,
         )
-        for game_id in game_iter:
-            start = game_id * cfg.agents_per_game
-            end = start + cfg.agents_per_game
-            game_population = shuffled[start:end]
+        winner_rows_by_game, weeks_ended_by_game = _play_survivor_games_with_population(
+            game_populations=game_populations,
+            weekly_log_odds=weekly_log_odds,
+            winner_masks_by_game_week=winner_masks,
+        )
 
-            winner_masks = _sample_winner_masks(
-                weekly_odds=weekly_odds,
-            )
-            winner_rows, weeks_played = _play_survivor_game_with_population(
-                game_population=game_population,
-                weekly_log_odds=weekly_log_odds,
-                winner_masks_by_week=winner_masks,
-            )
-            winners_per_game.append(int(winner_rows.numel()))
-            weeks_ended_per_game.append(weeks_played)
+        offspring_populations = _clone_winners_to_game_size(
+            game_populations=game_populations,
+            winner_masks=winner_rows_by_game,
+            mutation_std=cfg.mutation_std,
+        )
+        population = offspring_populations.reshape(cfg.total_agents, cfg.num_teams)
 
-            offspring = _clone_winners_to_game_size(
-                winners=game_population[winner_rows],
-                game_size=cfg.agents_per_game,
-                mutation_std=cfg.mutation_std,
-            )
-            next_population[start:end] = offspring
-
-        population = next_population
-        avg_winners = sum(winners_per_game) / len(winners_per_game)
-        avg_week_game_ended = sum(weeks_ended_per_game) / len(weeks_ended_per_game)
+        winners_per_game = winner_rows_by_game.sum(dim=1)
+        avg_winners = float(winners_per_game.float().mean().item())
+        avg_week_game_ended = float(weeks_ended_by_game.float().mean().item())
+        max_winners = int(winners_per_game.max().item())
         generation_summary = (
             f"Generation {generation_id + 1}/{cfg.num_generations}: "
             f"avg winners/game={avg_winners:.2f}, "
             f"avg week game ended={avg_week_game_ended:.2f}, "
-            f"max={max(winners_per_game)}, "
+            f"max={max_winners}, "
             f"new_agents={population.shape[0]}"
         )
         tqdm.write(generation_summary)
         generation_iter.set_postfix(
             avg_winners=f"{avg_winners:.2f}",
             avg_week_ended=f"{avg_week_game_ended:.2f}",
-            max_winners=max(winners_per_game),
+            max_winners=max_winners,
         )
         if cfg.checkpoint_every_generation and cfg.save_weights_path:
             checkpoint_path = _checkpoint_path_for_generation(

@@ -1,5 +1,2 @@
---extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.5.1+cu121 ; platform_system == "Windows"
-torch>=2.2,<3.0 ; platform_system != "Windows"
+torch>=2.2,<3.0
 tqdm>=4.66,<5.0
-numpy>=1.26,<3.0

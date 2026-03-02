@@ -578,11 +578,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-weeks", type=int, default=18)
 
     # Evolution loop mode args.
-    parser.add_argument("--total-agents", type=int, default=1_000_000)
+    parser.add_argument("--total-agents", type=int, default=10_000_000)
     parser.add_argument("--agents-per-game", type=int, default=1_000)
-    parser.add_argument("--num-generations", type=int, default=10000)
-    parser.add_argument("--mutation-std", type=float, default=0.05)
-    parser.add_argument("--odds-weight", type=float, default=1.0)
+    parser.add_argument("--num-generations", type=int, default=100)
+    parser.add_argument("--mutation-std", type=float, default=0.6)
+    parser.add_argument("--odds-weight", type=float, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--load-weights-path", type=str, default=DEFAULT_EVOLUTION_WEIGHTS_PATH)
     parser.add_argument("--save-weights-path", type=str, default=DEFAULT_EVOLUTION_WEIGHTS_PATH)

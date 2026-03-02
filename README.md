@@ -93,3 +93,29 @@ python3 bare_bones_survivor_env.py \
   --save-weights-path checkpoints/evo_weights.pt \
   --checkpoint-every-generation
 ```
+
+## Sample an agent from saved weights
+
+You can load a saved evolution checkpoint, sample one agent from the population, and print that agent's team-pick probability distribution at each week.
+
+Top-5 per week:
+
+```bash
+python3 bare_bones_survivor_env.py \
+  --mode sample-agent \
+  --load-weights-path checkpoints/evolution_population.pt \
+  --schedule-csv-path cleaned_grid2.csv \
+  --sample-max-weeks 18 \
+  --sample-top-k 5 \
+  --seed 42
+```
+
+Use a specific agent id and print the full per-team distribution:
+
+```bash
+python3 bare_bones_survivor_env.py \
+  --mode sample-agent \
+  --load-weights-path checkpoints/evolution_population.pt \
+  --sample-agent-id 1234 \
+  --print-full-distribution
+```

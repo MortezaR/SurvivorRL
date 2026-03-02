@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 from tqdm.auto import tqdm
@@ -308,10 +308,16 @@ def _save_evolution_weights(
     torch.save(payload, checkpoint_path)
 
 
-def _load_evolution_weights(path: str, cfg: EvolutionLoopConfig) -> torch.Tensor:
+def _load_population_checkpoint(path: str) -> tuple[torch.Tensor, dict[str, Any]]:
     payload = torch.load(path, map_location="cpu")
-    if isinstance(payload, dict) and "population" in payload:
+    metadata: dict[str, Any] = {}
+    if isinstance(payload, dict):
+        if "population" not in payload:
+            raise ValueError(
+                f"Checkpoint {path} did not contain a 'population' tensor."
+            )
         population = payload["population"]
+        metadata = {k: v for k, v in payload.items() if k != "population"}
     else:
         population = payload
 
@@ -319,6 +325,17 @@ def _load_evolution_weights(path: str, cfg: EvolutionLoopConfig) -> torch.Tensor
         raise ValueError(
             f"Checkpoint {path} did not contain a valid tensor under 'population'."
         )
+    if population.ndim != 2:
+        raise ValueError(
+            f"Checkpoint {path} population must be rank-2 [total_agents, num_teams], "
+            f"found shape {tuple(population.shape)}."
+        )
+
+    return population.detach().clone().to(dtype=torch.float32), metadata
+
+
+def _load_evolution_weights(path: str, cfg: EvolutionLoopConfig) -> torch.Tensor:
+    population, _ = _load_population_checkpoint(path)
 
     expected_shape = (cfg.total_agents, cfg.num_teams)
     if tuple(population.shape) != expected_shape:
@@ -444,11 +461,114 @@ def run_evolution_loop(cfg: EvolutionLoopConfig) -> None:
         print(f"Saved final evolution weights to: {cfg.save_weights_path}")
 
 
+def _format_probs(
+    probs: torch.Tensor,
+    team_names: List[str],
+    team_ids: List[int],
+) -> str:
+    return ", ".join(
+        f"{team_names[team_id]}={float(probs[team_id]):.4f}" for team_id in team_ids
+    )
+
+
+def run_sample_agent_distribution(
+    weights_path: str,
+    schedule_csv_path: str,
+    max_weeks: int,
+    sample_agent_id: Optional[int],
+    top_k: int,
+    print_full_distribution: bool,
+    odds_weight: float,
+    seed: int,
+) -> None:
+    if top_k <= 0:
+        raise ValueError("--sample-top-k must be > 0")
+    if max_weeks <= 0:
+        raise ValueError("--sample-max-weeks must be > 0")
+    if not Path(weights_path).exists():
+        raise ValueError(
+            f"Weights file was not found: {weights_path}. "
+            "Provide --load-weights-path to a saved evolution checkpoint."
+        )
+
+    torch.manual_seed(seed)
+    population, metadata = _load_population_checkpoint(weights_path)
+    total_agents, num_teams = int(population.shape[0]), int(population.shape[1])
+
+    selected_agent_id: int
+    if sample_agent_id is None:
+        selected_agent_id = int(torch.randint(0, total_agents, (1,)).item())
+    else:
+        if not 0 <= sample_agent_id < total_agents:
+            raise ValueError(
+                f"--sample-agent-id must be in [0, {total_agents - 1}], "
+                f"found {sample_agent_id}."
+            )
+        selected_agent_id = sample_agent_id
+
+    checkpoint_generation = metadata.get("generation_id")
+    if checkpoint_generation is not None:
+        print(f"Checkpoint generation: {checkpoint_generation}")
+    print(f"Loaded weights from: {weights_path}")
+    print(f"Population shape: agents={total_agents}, teams={num_teams}")
+    print(f"Sampled agent id: {selected_agent_id}")
+    print(f"Sampling seed: {seed}")
+
+    schedule = load_schedule_from_csv(
+        csv_path=schedule_csv_path,
+        num_weeks=max_weeks,
+        num_teams=num_teams,
+    )
+    weekly_odds = _matchup_rows_to_weekly_odds(
+        matchup_table=schedule.feature_rows,
+        num_weeks=max_weeks,
+        num_teams=num_teams,
+        device=torch.device("cpu"),
+    )
+    weekly_log_odds = torch.log(weekly_odds.clamp_min(1e-6)) * odds_weight
+    agent_logits = population[selected_agent_id]
+    picked_teams: set[int] = set()
+    week_pick_generator = torch.Generator(device="cpu")
+    week_pick_generator.manual_seed(seed + 1)
+
+    print(
+        f"Schedule: {schedule_csv_path} | weeks={max_weeks} | odds_weight={odds_weight:.3f}"
+    )
+    for week_id in range(max_weeks):
+        logits = agent_logits + weekly_log_odds[week_id]
+        if picked_teams and len(picked_teams) < num_teams:
+            masked_logits = logits.clone()
+            masked_logits[list(picked_teams)] = -1e9
+            logits = masked_logits
+        probs = torch.softmax(logits, dim=0)
+
+        picked_team = int(
+            torch.multinomial(probs, num_samples=1, generator=week_pick_generator).item()
+        )
+        picked_teams.add(picked_team)
+
+        pick_name = schedule.team_names[picked_team]
+        pick_prob = float(probs[picked_team])
+        pick_win_odds = float(weekly_odds[week_id, picked_team])
+        print(
+            f"Week {week_id + 1:02d}: sampled_pick={pick_name} "
+            f"(pick_prob={pick_prob:.4f}, win_odds={pick_win_odds:.4f})"
+        )
+
+        if print_full_distribution:
+            team_ids = list(range(num_teams))
+            print(f"  distribution: {_format_probs(probs, schedule.team_names, team_ids)}")
+        else:
+            k = min(top_k, num_teams)
+            top_team_ids = torch.topk(probs, k=k).indices.tolist()
+            print(f"  top_{k}: {_format_probs(probs, schedule.team_names, top_team_ids)}")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Single-game and evolutionary survivor simulations.")
     parser.add_argument(
         "--mode",
-        choices=["single-game", "evolution-loop"],
+        choices=["single-game", "evolution-loop", "sample-agent"],
         default="evolution-loop",
     )
 
@@ -468,11 +588,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-weights-path", type=str, default=DEFAULT_EVOLUTION_WEIGHTS_PATH)
     parser.add_argument("--checkpoint-every-generation", action="store_true")
     parser.add_argument("--schedule-csv-path", type=str, default=DEFAULT_SCHEDULE_CSV_PATH)
+
+    # Sample-agent mode args.
+    parser.add_argument("--sample-agent-id", type=int, default=None)
+    parser.add_argument("--sample-top-k", type=int, default=5)
+    parser.add_argument("--sample-max-weeks", type=int, default=18)
+    parser.add_argument("--print-full-distribution", action="store_true")
     return parser
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+
+    if args.mode == "sample-agent":
+        run_sample_agent_distribution(
+            weights_path=args.load_weights_path,
+            schedule_csv_path=args.schedule_csv_path,
+            max_weeks=args.sample_max_weeks,
+            sample_agent_id=args.sample_agent_id,
+            top_k=args.sample_top_k,
+            print_full_distribution=args.print_full_distribution,
+            odds_weight=args.odds_weight,
+            seed=args.seed,
+        )
+        return
 
     if args.mode == "evolution-loop":
         loop_cfg = EvolutionLoopConfig(

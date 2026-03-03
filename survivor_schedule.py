@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
@@ -36,10 +35,6 @@ def load_schedule_from_csv(
     """
     Load a team-week schedule from CSV into feature rows for featurization.
     """
-    if num_weeks <= 0:
-        raise ValueError("num_weeks must be > 0")
-    if num_teams <= 0:
-        raise ValueError("num_teams must be > 0")
 
     path = Path(csv_path)
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -79,29 +74,3 @@ def load_schedule_from_csv(
         num_weeks=num_weeks,
         num_teams=num_teams,
     )
-
-
-def sample_weekly_winners(
-    matchup_table: List[FeatureMatchupRow],
-    num_weeks: int,
-    num_teams: int,
-) -> List[List[int]]:
-    """
-    Sample winners from per-team weekly probabilities.
-    Each team's weekly outcome is sampled independently.
-    """
-    weekly_probs: List[List[float]] = [[0.0 for _ in range(num_teams)] for _ in range(num_weeks)]
-    for week_id, team_id, win_prob in matchup_table:
-        if 0 <= week_id < num_weeks and 0 <= team_id < num_teams:
-            weekly_probs[week_id][team_id] = max(0.0, min(1.0, float(win_prob)))
-
-    rng = random.Random()
-    winners_by_week: List[List[int]] = []
-    for week_id in range(num_weeks):
-        week_winners: List[int] = []
-        for team_id, win_prob in enumerate(weekly_probs[week_id]):
-            if win_prob > 0.0 and rng.random() < win_prob:
-                week_winners.append(team_id)
-        winners_by_week.append(week_winners)
-
-    return winners_by_week

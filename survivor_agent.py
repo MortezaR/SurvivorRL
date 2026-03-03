@@ -74,14 +74,28 @@ def featurize(
     return x  # [D]
 
 class BareBonesPickerNet(nn.Module):
-    def __init__(self, input_dim, num_teams, agent_id):
+    def __init__(self, input_dim, num_teams, agent_id, feature_cfg: Config):
         super().__init__()
         self.agent_id = agent_id
+        self.feature_cfg = feature_cfg
         self.fc1 = nn.Linear(input_dim, 128)
         self.fc2 = nn.Linear(128, 128)
         self.fc3 = nn.Linear(128, num_teams)
 
-    def forward(self, x, unavailable_team_ids: Optional[List[int]] = None):
+    def forward(
+        self,
+        contestant_picks: Dict[int, int],
+        matchup_table: List[MatchupRow],
+        current_week: int,
+        unavailable_team_ids: Optional[List[int]] = None,
+    ):
+        x = featurize(
+            cfg=self.feature_cfg,
+            contestant_picks=contestant_picks,
+            matchup_table=matchup_table,
+            agent_id=self.agent_id,
+            current_week=current_week,
+        ).to(device=self.fc1.weight.device, dtype=self.fc1.weight.dtype)
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
         logits = self.fc3(x)
@@ -105,26 +119,3 @@ class BareBonesPickerNet(nn.Module):
         child = copy.deepcopy(model)
         BareBonesPickerNet.add_gaussian_noise(child, std)
         return child
-
-# ---------------------------
-# Example wiring
-# ---------------------------
-if __name__ == "__main__":
-    cfg = Config(max_contestants=200, max_teams=32, max_weeks=18)
-    C, T, W = cfg.max_contestants, cfg.max_teams, cfg.max_weeks
-
-    # Example inputs (replace with real data)
-    contestant_picks = {0: 3, 7: 10, 15: 3}     # active only
-    matchup_table = [
-        (0, 3, 0.55),  # week 0, team 3, win probability
-        (0, 2, 0.48),  # week 0, team 2, win probability
-        (1, 1, 0.62),  # week 1, team 1, win probability
-    ]
-    agent_id = 7
-
-    x = featurize(cfg, contestant_picks, matchup_table, agent_id, current_week=0)
-    model = BareBonesPickerNet(input_dim=x.numel(), num_teams=T, agent_id=agent_id)
-
-    p_pick = model(x)  # [T], sums to 1
-    print("Pick distribution:", p_pick)
-    print("Sum:", p_pick.sum().detach().item())

@@ -16,15 +16,18 @@ Dependencies are managed in `requirements.txt`:
 
 - `torch`
 - `tqdm`
+- `numpy`
 
-## Evolution loop (1,000,000 agents)
+## Evolution loop
 
-`survivor_cli.py` supports a large-scale evolutionary loop:
+`survivor_cli.py` supports an evolutionary loop:
 
-- randomize `1,000,000` agents into `1,000` games of `1,000`
+- randomize agents into games
 - run each game
-- clone winners directly so each game always outputs `1,000` offspring
+- clone winners directly so each game always outputs `agents_per_game` offspring
 - repeat for the configured number of generations
+
+The CLI defaults are intentionally small (`200` total agents, `20` per game, `20` generations) so a no-arg run is a practical smoke test. Scale up with explicit flags as needed.
 
 By default, evolution mode now auto-loads and auto-saves population weights at:
 
@@ -39,9 +42,10 @@ Example:
 ```bash
 python3 survivor_cli.py \
   --mode evolution-loop \
-  --total-agents 1000000 \
-  --agents-per-game 1000 \
+  --total-agents 2000 \
+  --agents-per-game 20 \
   --num-generations 2 \
+  --device auto \
   --num-teams 32 \
   --max-weeks 18
 ```
@@ -61,6 +65,7 @@ Resume from saved weights:
 python3 survivor_cli.py \
   --mode evolution-loop \
   --load-weights-path checkpoints/evo_weights.pt \
+  --device auto \
   --num-generations 50
 ```
 

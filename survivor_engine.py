@@ -25,17 +25,43 @@ DEFAULT_EVOLUTION_WEIGHTS_PATH = "checkpoints/evolution_population.pt"
 DEFAULT_SCHEDULE_CSV_PATH = "cleaned_grid2.csv"
 
 
-def _runtime_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def resolve_runtime_device(requested_device: str = "auto") -> torch.device:
+    requested = requested_device.lower()
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("--device=cuda requested, but CUDA is not available.")
+        return torch.device("cuda")
+
+    if requested == "mps":
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is None or not mps_backend.is_built():
+            raise ValueError("--device=mps requested, but this PyTorch build has no MPS support.")
+        if not mps_backend.is_available():
+            raise ValueError("--device=mps requested, but MPS is not available on this machine.")
+        return torch.device("mps")
+
+    if requested == "cpu":
+        return torch.device("cpu")
+
+    raise ValueError(f"Unsupported device '{requested_device}'. Use auto/cuda/mps/cpu.")
 
 
 @dataclass
 class EvolutionLoopConfig:
-    total_agents: int = 10_000_000
-    agents_per_game: int = 1_000
+    total_agents: int = 200
+    agents_per_game: int = 20
     num_teams: int = 32
     max_weeks: int = 18
-    num_generations: int = 100
+    num_generations: int = 20
+    device: str = "auto"
     load_weights_path: Optional[str] = DEFAULT_EVOLUTION_WEIGHTS_PATH
     save_weights_path: Optional[str] = DEFAULT_EVOLUTION_WEIGHTS_PATH
     checkpoint_every_generation: bool = False
@@ -56,6 +82,7 @@ class EvolutionGenerationSummary:
 @dataclass
 class EvolutionLoopResult:
     final_save_path: Optional[str]
+    runtime_device: str
 
 
 def _feature_input_dim(feature_cfg: AgentFeatureConfig) -> int:
@@ -242,7 +269,7 @@ def run_evolution_loop(
         raise ValueError("--max-weeks must be > 0")
 
     num_games = cfg.total_agents // cfg.agents_per_game
-    device = _runtime_device()
+    device = resolve_runtime_device(cfg.device)
 
     feature_cfg = AgentFeatureConfig(
         max_contestants=cfg.agents_per_game,
@@ -412,4 +439,5 @@ def run_evolution_loop(
 
     return EvolutionLoopResult(
         final_save_path=final_save_path,
+        runtime_device=str(device),
     )

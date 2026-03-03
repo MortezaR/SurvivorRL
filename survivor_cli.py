@@ -11,6 +11,7 @@ from survivor_engine import (
     DEFAULT_SCHEDULE_CSV_PATH,
     EvolutionGenerationSummary,
     EvolutionLoopConfig,
+    resolve_runtime_device,
     run_evolution_loop,
 )
 from survivor_sampling import sample_agent_distribution
@@ -35,11 +36,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     # Evolution loop mode args.
-    parser.add_argument("--total-agents", type=int, default=10_000_000)
-    parser.add_argument("--agents-per-game", type=int, default=1_000)
-    parser.add_argument("--num-generations", type=int, default=10000)
+    parser.add_argument("--total-agents", type=int, default=1000000)
+    parser.add_argument("--agents-per-game", type=int, default=1000)
+    parser.add_argument("--num-generations", type=int, default=20)
     parser.add_argument("--num-teams", type=int, default=32)
     parser.add_argument("--max-weeks", type=int, default=18)
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     parser.add_argument("--load-weights-path", type=str, default=DEFAULT_EVOLUTION_WEIGHTS_PATH)
     parser.add_argument("--save-weights-path", type=str, default=DEFAULT_EVOLUTION_WEIGHTS_PATH)
     parser.add_argument("--checkpoint-every-generation", action="store_true")
@@ -70,6 +72,7 @@ def _run_evolution_mode(args: argparse.Namespace) -> None:
         num_teams=args.num_teams,
         max_weeks=args.max_weeks,
         num_generations=args.num_generations,
+        device=args.device,
         load_weights_path=args.load_weights_path,
         save_weights_path=args.save_weights_path,
         checkpoint_every_generation=args.checkpoint_every_generation,
@@ -83,6 +86,9 @@ def _run_evolution_mode(args: argparse.Namespace) -> None:
             f"No saved weights found at {loop_cfg.load_weights_path}. "
             "Starting from random initialization."
         )
+
+    # Validate and normalize the device choice before creating the progress bar.
+    loop_cfg.device = str(resolve_runtime_device(loop_cfg.device))
 
     num_games = loop_cfg.total_agents // loop_cfg.agents_per_game
     progress = tqdm(total=loop_cfg.num_generations, desc="Generations", unit="gen")
@@ -107,6 +113,7 @@ def _run_evolution_mode(args: argparse.Namespace) -> None:
     finally:
         progress.close()
 
+    print(f"Runtime device: {result.runtime_device}")
     if result.final_save_path:
         print(f"Saved final evolution weights to: {result.final_save_path}")
 

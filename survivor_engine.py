@@ -43,10 +43,11 @@ def sample_weekly_winners(
 def survivor_game(
     agents: List[PickerNet],
     sampled_winning_teams: List[Tuple[int, List[int]]],
-) -> List[PickerNet]:
+) -> Tuple[List[PickerNet], int]:
 
     active_agents = list(agents)
     contestant_picks = {}
+    weeks_played = 0
     for week_idx in range(num_weeks):
         last_week_agents = list(active_agents)
         contestant_picks_upto_last_week = contestant_picks.copy()
@@ -67,13 +68,14 @@ def survivor_game(
             else:
                 contestant_picks.pop(agent.agent_id, None)
 
+        weeks_played = week_idx + 1
         if len(survivors) == 0:
-            return last_week_agents
+            return last_week_agents, weeks_played
         if len(survivors) == 1:
-            return survivors
+            return survivors, weeks_played
         active_agents = survivors
 
-    return active_agents
+    return active_agents, weeks_played
 
 
 def replicate_winners(
@@ -149,6 +151,7 @@ def evo_loop(
             shuffled = list(population)
             random.shuffle(shuffled)
             new_all_agents: List[PickerNet] = []
+            game_week_lengths: List[int] = []
 
             generation = tqdm(
                 range(0, len(shuffled), num_contestants),
@@ -159,7 +162,8 @@ def evo_loop(
             for start in generation:
                 game_agents = shuffled[start:start + num_contestants]
                 sampled_winning_teams = sample_weekly_winners(weekly_probs)
-                winners = survivor_game(game_agents, sampled_winning_teams)
+                winners, weeks_played = survivor_game(game_agents, sampled_winning_teams)
+                game_week_lengths.append(weeks_played)
 
                 replicated = replicate_winners(
                     winners=winners,
@@ -173,6 +177,12 @@ def evo_loop(
 
             for new_id, agent in enumerate(new_all_agents):
                 agent.agent_id = new_id
+
+            avg_week_length = sum(game_week_lengths) / len(game_week_lengths)
+            print(
+                f"Loop {loop_idx + 1}/{num_loops} average game length: "
+                f"{avg_week_length:.2f} weeks"
+            )
 
             population = new_all_agents
 

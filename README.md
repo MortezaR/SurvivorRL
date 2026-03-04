@@ -78,6 +78,28 @@ python3 survivor_cli.py \
   --checkpoint-every-generation
 ```
 
+Profile where compute time and memory are spent (CPU + CUDA ops table and Chrome trace):
+
+```bash
+python3 survivor_cli.py \
+  --mode evolution-loop \
+  --device cuda \
+  --total-agents 2000 \
+  --agents-per-game 20 \
+  --num-generations 2 \
+  --profile \
+  --profile-output-dir profiles \
+  --profile-warmup-games 1 \
+  --profile-active-games 10
+```
+
+When profiling is enabled, the CLI prints a run-specific output folder containing:
+
+- `trace.json` for Chrome/Perfetto timeline view
+- `cpu_time_top_ops.txt`
+- `cuda_time_top_ops.txt` (when CUDA activity is captured)
+- `cuda_memory_top_ops.txt` (when CUDA activity is captured)
+
 ## Sample an agent from saved weights
 
 You can load a saved evolution checkpoint, sample one agent from the population, and print that agent's team-pick probability distribution at each week.

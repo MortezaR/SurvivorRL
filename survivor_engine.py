@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -66,6 +68,29 @@ class EvolutionLoopConfig:
     save_weights_path: Optional[str] = DEFAULT_EVOLUTION_WEIGHTS_PATH
     checkpoint_every_generation: bool = False
     schedule_csv_path: str = DEFAULT_SCHEDULE_CSV_PATH
+    profiler: Optional["ProfilerConfig"] = None
+
+
+@dataclass
+class ProfilerConfig:
+    enabled: bool = False
+    output_dir: str = "profiles"
+    warmup_games: int = 1
+    active_games: int = 10
+    record_shapes: bool = True
+    with_stack: bool = False
+
+
+@dataclass
+class EvolutionProfilerArtifacts:
+    output_dir: str
+    chrome_trace_path: Optional[str]
+    cpu_time_table_path: Optional[str]
+    cuda_time_table_path: Optional[str]
+    cuda_memory_table_path: Optional[str]
+    profiled_steps: int
+    peak_cuda_memory_allocated_mb: Optional[float]
+    peak_cuda_memory_reserved_mb: Optional[float]
 
 
 @dataclass
@@ -83,6 +108,7 @@ class EvolutionGenerationSummary:
 class EvolutionLoopResult:
     final_save_path: Optional[str]
     runtime_device: str
+    profiler_artifacts: Optional[EvolutionProfilerArtifacts] = None
 
 
 def _feature_input_dim(feature_cfg: AgentFeatureConfig) -> int:
@@ -251,6 +277,109 @@ def _clone_game_winners_to_offspring_models(
     return offspring_models
 
 
+def _write_profiler_table(
+    output_dir: Path,
+    filename: str,
+    table: str,
+) -> str:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / filename
+    path.write_text(table, encoding="utf-8")
+    return str(path)
+
+
+def _build_profiler(
+    profiler_cfg: ProfilerConfig,
+    runtime_device: torch.device,
+) -> tuple[Optional[torch.profiler.profile], List[torch.profiler.ProfilerActivity], int]:
+    if not profiler_cfg.enabled:
+        return None, [], 0
+
+    activities: List[torch.profiler.ProfilerActivity] = [torch.profiler.ProfilerActivity.CPU]
+    if runtime_device.type == "cuda" and torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+    total_profile_steps = profiler_cfg.warmup_games + profiler_cfg.active_games
+    if total_profile_steps <= 0:
+        raise ValueError("--profile-warmup-games + --profile-active-games must be > 0")
+
+    profiler = torch.profiler.profile(
+        activities=activities,
+        schedule=torch.profiler.schedule(
+            wait=0,
+            warmup=max(0, profiler_cfg.warmup_games),
+            active=max(1, profiler_cfg.active_games),
+            repeat=1,
+        ),
+        record_shapes=profiler_cfg.record_shapes,
+        profile_memory=True,
+        with_stack=profiler_cfg.with_stack,
+    )
+    return profiler, activities, total_profile_steps
+
+
+def _finalize_profiler(
+    profiler: torch.profiler.profile,
+    profiler_cfg: ProfilerConfig,
+    activities: List[torch.profiler.ProfilerActivity],
+    profiled_steps: int,
+    runtime_device: torch.device,
+) -> EvolutionProfilerArtifacts:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(profiler_cfg.output_dir) / f"evolution_profile_{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cpu_time_table_path: Optional[str] = None
+    cuda_time_table_path: Optional[str] = None
+    cuda_memory_table_path: Optional[str] = None
+    chrome_trace_path: Optional[str] = None
+
+    cpu_table = profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=100)
+    cpu_time_table_path = _write_profiler_table(output_dir, "cpu_time_top_ops.txt", cpu_table)
+
+    if torch.profiler.ProfilerActivity.CUDA in activities:
+        cuda_time_table = profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=100)
+        cuda_time_table_path = _write_profiler_table(
+            output_dir,
+            "cuda_time_top_ops.txt",
+            cuda_time_table,
+        )
+        cuda_memory_table = profiler.key_averages().table(
+            sort_by="self_cuda_memory_usage",
+            row_limit=100,
+        )
+        cuda_memory_table_path = _write_profiler_table(
+            output_dir,
+            "cuda_memory_top_ops.txt",
+            cuda_memory_table,
+        )
+
+    try:
+        trace_path = output_dir / "trace.json"
+        profiler.export_chrome_trace(str(trace_path))
+        chrome_trace_path = str(trace_path)
+    except RuntimeError:
+        # If no active step was captured, export_chrome_trace can fail.
+        chrome_trace_path = None
+
+    peak_allocated_mb: Optional[float] = None
+    peak_reserved_mb: Optional[float] = None
+    if runtime_device.type == "cuda" and torch.cuda.is_available():
+        peak_allocated_mb = float(torch.cuda.max_memory_allocated(runtime_device)) / (1024 ** 2)
+        peak_reserved_mb = float(torch.cuda.max_memory_reserved(runtime_device)) / (1024 ** 2)
+
+    return EvolutionProfilerArtifacts(
+        output_dir=str(output_dir),
+        chrome_trace_path=chrome_trace_path,
+        cpu_time_table_path=cpu_time_table_path,
+        cuda_time_table_path=cuda_time_table_path,
+        cuda_memory_table_path=cuda_memory_table_path,
+        profiled_steps=profiled_steps,
+        peak_cuda_memory_allocated_mb=peak_allocated_mb,
+        peak_cuda_memory_reserved_mb=peak_reserved_mb,
+    )
+
+
 def run_evolution_loop(
     cfg: EvolutionLoopConfig,
     on_generation: Optional[Callable[[EvolutionGenerationSummary], None]] = None,
@@ -267,9 +396,24 @@ def run_evolution_loop(
         raise ValueError("--num-teams must be > 1")
     if cfg.max_weeks <= 0:
         raise ValueError("--max-weeks must be > 0")
+    if cfg.profiler is not None:
+        if cfg.profiler.warmup_games < 0:
+            raise ValueError("--profile-warmup-games must be >= 0")
+        if cfg.profiler.active_games <= 0:
+            raise ValueError("--profile-active-games must be > 0")
 
     num_games = cfg.total_agents // cfg.agents_per_game
     device = resolve_runtime_device(cfg.device)
+
+    profiler_cfg = cfg.profiler if cfg.profiler is not None else ProfilerConfig(enabled=False)
+    profiler, profiler_activities, total_profile_steps = _build_profiler(
+        profiler_cfg=profiler_cfg,
+        runtime_device=device,
+    )
+    profiled_steps = 0
+
+    if profiler is not None and device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
 
     feature_cfg = AgentFeatureConfig(
         max_contestants=cfg.agents_per_game,
@@ -332,92 +476,101 @@ def run_evolution_loop(
             )
             population_models.append(model)
 
-    for generation_id in range(cfg.num_generations):
-        shuffled_indices = torch.randperm(cfg.total_agents).tolist()
-        winner_masks = _sample_winner_masks(
-            weekly_odds=weekly_odds,
-            num_games=num_games,
-        )
+    profiler_context = profiler if profiler is not None else nullcontext()
+    with profiler_context as prof:
+        for generation_id in range(cfg.num_generations):
+            shuffled_indices = torch.randperm(cfg.total_agents).tolist()
+            winner_masks = _sample_winner_masks(
+                weekly_odds=weekly_odds,
+                num_games=num_games,
+            )
 
-        next_population_models: List[BareBonesPickerNet] = []
-        winners_per_game: List[int] = []
-        weeks_ended_by_game: List[int] = []
+            next_population_models: List[BareBonesPickerNet] = []
+            winners_per_game: List[int] = []
+            weeks_ended_by_game: List[int] = []
 
-        with torch.no_grad():
-            for game_id in range(num_games):
-                start = game_id * cfg.agents_per_game
-                stop = start + cfg.agents_per_game
-                game_agent_indices = shuffled_indices[start:stop]
+            with torch.no_grad():
+                for game_id in range(num_games):
+                    start = game_id * cfg.agents_per_game
+                    stop = start + cfg.agents_per_game
+                    game_agent_indices = shuffled_indices[start:stop]
 
-                game_models: List[BareBonesPickerNet] = []
-                for seat_id, population_idx in enumerate(game_agent_indices):
-                    model = BareBonesPickerNet.mutated_copy(
-                        population_models[population_idx],
-                        std=0.0,
+                    game_models: List[BareBonesPickerNet] = []
+                    for seat_id, population_idx in enumerate(game_agent_indices):
+                        model = BareBonesPickerNet.mutated_copy(
+                            population_models[population_idx],
+                            std=0.0,
+                        )
+                        model.agent_id = seat_id
+                        model.to(device)
+                        model.eval()
+                        game_models.append(model)
+
+                    winner_slots, weeks_played = _play_single_game_with_models(
+                        game_models=game_models,
+                        feature_cfg=feature_cfg,
+                        rows_by_week=rows_by_week,
+                        winner_mask_by_week=winner_masks[game_id],
                     )
-                    model.agent_id = seat_id
-                    model.to(device)
-                    model.eval()
-                    game_models.append(model)
+                    winners_per_game.append(len(winner_slots))
+                    weeks_ended_by_game.append(weeks_played)
 
-                winner_slots, weeks_played = _play_single_game_with_models(
-                    game_models=game_models,
-                    feature_cfg=feature_cfg,
-                    rows_by_week=rows_by_week,
-                    winner_mask_by_week=winner_masks[game_id],
-                )
-                winners_per_game.append(len(winner_slots))
-                weeks_ended_by_game.append(weeks_played)
+                    offspring_models = _clone_game_winners_to_offspring_models(
+                        game_models=game_models,
+                        winner_slots=winner_slots,
+                        game_size=cfg.agents_per_game,
+                    )
+                    next_population_models.extend(offspring_models)
 
-                offspring_models = _clone_game_winners_to_offspring_models(
-                    game_models=game_models,
-                    winner_slots=winner_slots,
-                    game_size=cfg.agents_per_game,
-                )
-                next_population_models.extend(offspring_models)
+                    if prof is not None and profiled_steps < total_profile_steps:
+                        prof.step()
+                        profiled_steps += 1
 
-        population_models = next_population_models
+            population_models = next_population_models
 
-        winners_per_game_tensor = torch.tensor(winners_per_game, dtype=torch.float32)
-        weeks_ended_tensor = torch.tensor(weeks_ended_by_game, dtype=torch.float32)
-        avg_winners = float(winners_per_game_tensor.mean().item())
-        avg_week_game_ended = float(weeks_ended_tensor.mean().item())
-        max_winners = int(winners_per_game_tensor.max().item())
+            winners_per_game_tensor = torch.tensor(winners_per_game, dtype=torch.float32)
+            weeks_ended_tensor = torch.tensor(weeks_ended_by_game, dtype=torch.float32)
+            avg_winners = float(winners_per_game_tensor.mean().item())
+            avg_week_game_ended = float(weeks_ended_tensor.mean().item())
+            max_winners = int(winners_per_game_tensor.max().item())
 
-        checkpoint_path: Optional[str] = None
-        if cfg.checkpoint_every_generation and cfg.save_weights_path:
-            path = checkpoint_path_for_generation(
-                cfg.save_weights_path,
-                generation_id=generation_id + 1,
-            )
-            save_population_checkpoint(
-                path=str(path),
-                population_genomes=[_extract_genome(model) for model in population_models],
-                metadata={
-                    "generation_id": generation_id + 1,
-                    "total_agents": cfg.total_agents,
-                    "agents_per_game": cfg.agents_per_game,
-                    "num_teams": cfg.num_teams,
-                    "max_weeks": cfg.max_weeks,
-                    "schedule_csv_path": cfg.schedule_csv_path,
-                    "feature_max_contestants": feature_cfg.max_contestants,
-                    "num_params": num_params,
-                },
-            )
-            checkpoint_path = str(path)
-
-        if on_generation is not None:
-            on_generation(
-                EvolutionGenerationSummary(
+            checkpoint_path: Optional[str] = None
+            if cfg.checkpoint_every_generation and cfg.save_weights_path:
+                path = checkpoint_path_for_generation(
+                    cfg.save_weights_path,
                     generation_id=generation_id + 1,
-                    total_generations=cfg.num_generations,
-                    avg_winners=avg_winners,
-                    avg_week_game_ended=avg_week_game_ended,
-                    max_winners=max_winners,
-                    new_agents=len(population_models),
-                    checkpoint_path=checkpoint_path,
                 )
-            )
+                save_population_checkpoint(
+                    path=str(path),
+                    population_genomes=[_extract_genome(model) for model in population_models],
+                    metadata={
+                        "generation_id": generation_id + 1,
+                        "total_agents": cfg.total_agents,
+                        "agents_per_game": cfg.agents_per_game,
+                        "num_teams": cfg.num_teams,
+                        "max_weeks": cfg.max_weeks,
+                        "schedule_csv_path": cfg.schedule_csv_path,
+                        "feature_max_contestants": feature_cfg.max_contestants,
+                        "num_params": num_params,
+                    },
+                )
+                checkpoint_path = str(path)
+
+            if on_generation is not None:
+                on_generation(
+                    EvolutionGenerationSummary(
+                        generation_id=generation_id + 1,
+                        total_generations=cfg.num_generations,
+                        avg_winners=avg_winners,
+                        avg_week_game_ended=avg_week_game_ended,
+                        max_winners=max_winners,
+                        new_agents=len(population_models),
+                        checkpoint_path=checkpoint_path,
+                    )
+                )
+
+        if prof is not None and device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
 
     final_save_path: Optional[str] = None
     if cfg.save_weights_path:
@@ -437,7 +590,18 @@ def run_evolution_loop(
         )
         final_save_path = cfg.save_weights_path
 
+    profiler_artifacts: Optional[EvolutionProfilerArtifacts] = None
+    if profiler is not None:
+        profiler_artifacts = _finalize_profiler(
+            profiler=profiler,
+            profiler_cfg=profiler_cfg,
+            activities=profiler_activities,
+            profiled_steps=profiled_steps,
+            runtime_device=device,
+        )
+
     return EvolutionLoopResult(
         final_save_path=final_save_path,
         runtime_device=str(device),
+        profiler_artifacts=profiler_artifacts,
     )

@@ -11,6 +11,7 @@ from survivor_engine import (
     DEFAULT_SCHEDULE_CSV_PATH,
     EvolutionGenerationSummary,
     EvolutionLoopConfig,
+    ProfilerConfig,
     resolve_runtime_device,
     run_evolution_loop,
 )
@@ -46,6 +47,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-weights-path", type=str, default=DEFAULT_EVOLUTION_WEIGHTS_PATH)
     parser.add_argument("--checkpoint-every-generation", action="store_true")
     parser.add_argument("--schedule-csv-path", type=str, default=DEFAULT_SCHEDULE_CSV_PATH)
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-output-dir", type=str, default="profiles")
+    parser.add_argument("--profile-warmup-games", type=int, default=1)
+    parser.add_argument("--profile-active-games", type=int, default=10)
+    parser.add_argument("--profile-with-stack", action="store_true")
 
     # Sample-agent mode args.
     parser.add_argument("--sample-agent-id", type=int, default=None)
@@ -77,6 +83,13 @@ def _run_evolution_mode(args: argparse.Namespace) -> None:
         save_weights_path=args.save_weights_path,
         checkpoint_every_generation=args.checkpoint_every_generation,
         schedule_csv_path=args.schedule_csv_path,
+        profiler=ProfilerConfig(
+            enabled=args.profile,
+            output_dir=args.profile_output_dir,
+            warmup_games=args.profile_warmup_games,
+            active_games=args.profile_active_games,
+            with_stack=args.profile_with_stack,
+        ),
     )
 
     if loop_cfg.load_weights_path and Path(loop_cfg.load_weights_path).exists():
@@ -116,6 +129,26 @@ def _run_evolution_mode(args: argparse.Namespace) -> None:
     print(f"Runtime device: {result.runtime_device}")
     if result.final_save_path:
         print(f"Saved final evolution weights to: {result.final_save_path}")
+    if result.profiler_artifacts is not None:
+        print(
+            "Profiler output: "
+            f"{result.profiler_artifacts.output_dir} "
+            f"(steps={result.profiler_artifacts.profiled_steps})"
+        )
+        if result.profiler_artifacts.chrome_trace_path:
+            print(f"  Chrome trace: {result.profiler_artifacts.chrome_trace_path}")
+        if result.profiler_artifacts.cpu_time_table_path:
+            print(f"  CPU op table: {result.profiler_artifacts.cpu_time_table_path}")
+        if result.profiler_artifacts.cuda_time_table_path:
+            print(f"  CUDA op table: {result.profiler_artifacts.cuda_time_table_path}")
+        if result.profiler_artifacts.cuda_memory_table_path:
+            print(f"  CUDA memory table: {result.profiler_artifacts.cuda_memory_table_path}")
+        if result.profiler_artifacts.peak_cuda_memory_allocated_mb is not None:
+            print(
+                "  Peak CUDA memory: "
+                f"allocated={result.profiler_artifacts.peak_cuda_memory_allocated_mb:.2f} MB, "
+                f"reserved={result.profiler_artifacts.peak_cuda_memory_reserved_mb:.2f} MB"
+            )
 
 
 def _run_sample_agent_mode(args: argparse.Namespace) -> None:

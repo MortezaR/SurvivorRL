@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
 import random
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
+from tqdm import tqdm
 
 from survivor_agent import PickerNet, Config
 from survivor_schedule import load_schedule_from_csv
 
 num_agents = 1_000
-num_contestants = 1_000
+num_contestants = 1_00
 num_weeks = 18
 num_teams = 32
 config = Config(num_contestants, num_teams, num_weeks)
@@ -91,6 +93,38 @@ def replicate_winners(
             replicated.append(child)
 
     return replicated
+def save_population_weights(population: List[PickerNet], output_path: str) -> None:
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "state_dicts": [agent.state_dict() for agent in population],
+        "agent_ids": [agent.agent_id for agent in population],
+    }
+    torch.save(payload, path)
+
+
+def load_population_weights(weights_path: str, cfg: Config) -> List[PickerNet]:
+
+    payload = torch.load(weights_path, map_location="cpu")
+    state_dicts = payload["state_dicts"]
+    agent_ids = payload.get("agent_ids", list(range(len(state_dicts))))
+
+    population: List[PickerNet] = []
+    for idx, state_dict in enumerate(state_dicts):
+        agent_id = agent_ids[idx] if idx < len(agent_ids) else idx
+        agent = PickerNet(agent_id=agent_id, cfg=cfg)
+        agent.load_state_dict(state_dict)
+        population.append(agent)
+
+    return population
+
+
+def move_population_to_device(population: List[PickerNet], device: torch.device) -> List[PickerNet]:
+
+    for agent in population:
+        agent.to(device)
+    return population
 
 
 def evo_loop(
@@ -98,32 +132,68 @@ def evo_loop(
     num_loops: int,
     num_contestants: int,
     noise_std: float = 0.01,
+    profile: bool = False,
+    profile_output_path: Optional[str] = None,
 ) -> List[PickerNet]:
 
-    for _ in range(num_loops):
+    if num_contestants <= 0:
+        raise ValueError("num_contestants must be > 0")
 
-        shuffled = list(all_agents)
-        random.shuffle(shuffled)
-        new_all_agents: List[PickerNet] = []
+    def _run_loop(
+        population: List[PickerNet],
+        profiler: Optional[torch.profiler.profile] = None,
+    ) -> List[PickerNet]:
+        loop_iter = tqdm(range(num_loops), desc="Evo loops")
 
-        for start in range(0, len(shuffled), num_contestants):
-            game_agents = shuffled[start:start + num_contestants]
-            sampled_winning_teams = sample_weekly_winners(weekly_probs)
-            winners = survivor_game(game_agents, sampled_winning_teams)
+        for loop_idx in loop_iter:
+            shuffled = list(population)
+            random.shuffle(shuffled)
+            new_all_agents: List[PickerNet] = []
 
-            replicated = replicate_winners(
-                winners=winners,
-                num_contestants=num_contestants,
-                noise_std=noise_std,
+            generation = tqdm(
+                range(0, len(shuffled), num_contestants),
+                desc=f"Loop {loop_idx + 1}/{num_loops} generation",
+                leave=False,
             )
-            new_all_agents.extend(replicated)
 
-        for new_id, agent in enumerate(new_all_agents):
-            agent.agent_id = new_id
+            for start in generation:
+                game_agents = shuffled[start:start + num_contestants]
+                sampled_winning_teams = sample_weekly_winners(weekly_probs)
+                winners = survivor_game(game_agents, sampled_winning_teams)
 
-        all_agents = new_all_agents
+                replicated = replicate_winners(
+                    winners=winners,
+                    num_contestants=num_contestants,
+                    noise_std=noise_std,
+                )
+                new_all_agents.extend(replicated)
 
-    return all_agents
+                if profiler is not None:
+                    profiler.step()
+
+            for new_id, agent in enumerate(new_all_agents):
+                agent.agent_id = new_id
+
+            population = new_all_agents
+
+        return population
+
+    if profile:
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        with torch.profiler.profile(activities=activities) as profiler:
+            final_population = _run_loop(all_agents, profiler=profiler)
+
+        if profile_output_path:
+            trace_path = Path(profile_output_path)
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            profiler.export_chrome_trace(str(trace_path))
+    else:
+        final_population = _run_loop(all_agents, profiler=None)
+
+    return final_population
         
 
 

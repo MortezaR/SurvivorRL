@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from typing import List, Tuple, Union
+from typing import List, Tuple
 
 import torch
 
@@ -27,12 +27,7 @@ for week_id, team_id, win_prob in schedule.feature_rows:
 def sample_weekly_winners(
     weekly_probs: List[List[Tuple[str, float]]],
 ) -> List[Tuple[int, List[int]]]:
-    """
-    For each week, sample winners using each team's win probability.
 
-    Returns:
-      [(week_id, [winning_team_ids]), ...]
-    """
     sampled: List[Tuple[int, List[int]]] = []
     for week_id, week_probs in enumerate(weekly_probs):
         week_winners: List[int] = []
@@ -46,7 +41,7 @@ def sample_weekly_winners(
 def survivor_game(
     agents: List[PickerNet],
     sampled_winning_teams: List[Tuple[int, List[int]]],
-) -> Union[PickerNet, List[PickerNet]]:
+) -> List[PickerNet]:
 
     active_agents = list(agents)
     contestant_picks = {}
@@ -73,7 +68,7 @@ def survivor_game(
         if len(survivors) == 0:
             return last_week_agents
         if len(survivors) == 1:
-            return survivors[0]
+            return survivors
         active_agents = survivors
 
     return active_agents
@@ -84,36 +79,51 @@ def replicate_winners(
     num_contestants: int,
     noise_std: float = 0.01,
 ) -> List[PickerNet]:
-    """
-    Replicate winners proportionally to fill `num_contestants`.
-
-    Each replica is a mutated copy produced by PickerNet.mutated_copy.
-    Returns exactly `num_contestants` mutated agents.
-    """
-    if num_contestants <= 0:
-        return []
-    if len(winners) == 0:
-        raise ValueError("replicate_winners requires at least one winner.")
 
     base_copies = num_contestants // len(winners)
     remainder = num_contestants % len(winners)
 
     replicated: List[PickerNet] = []
-    next_agent_id = 0
     for winner_idx, winner in enumerate(winners):
         num_copies = base_copies + (1 if winner_idx < remainder else 0)
         for _ in range(num_copies):
             child = PickerNet.mutated_copy(winner, std=noise_std)
-            child.agent_id = next_agent_id
             replicated.append(child)
-            next_agent_id += 1
 
     return replicated
-# def
-# 
-# def evo_loop():
-#     winners = []
-#     for week in range(num_weeks):
+
+
+def evo_loop(
+    all_agents: List[PickerNet],
+    num_loops: int,
+    num_contestants: int,
+    noise_std: float = 0.01,
+) -> List[PickerNet]:
+
+    for _ in range(num_loops):
+
+        shuffled = list(all_agents)
+        random.shuffle(shuffled)
+        new_all_agents: List[PickerNet] = []
+
+        for start in range(0, len(shuffled), num_contestants):
+            game_agents = shuffled[start:start + num_contestants]
+            sampled_winning_teams = sample_weekly_winners(weekly_probs)
+            winners = survivor_game(game_agents, sampled_winning_teams)
+
+            replicated = replicate_winners(
+                winners=winners,
+                num_contestants=num_contestants,
+                noise_std=noise_std,
+            )
+            new_all_agents.extend(replicated)
+
+        for new_id, agent in enumerate(new_all_agents):
+            agent.agent_id = new_id
+
+        all_agents = new_all_agents
+
+    return all_agents
         
 
 

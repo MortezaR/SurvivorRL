@@ -10,8 +10,8 @@ from tqdm import tqdm
 from survivor_agent import PickerNet, Config
 from survivor_schedule import load_schedule_from_csv
 
-num_agents = 1_000
-num_contestants = 1_00
+num_agents = 1000
+num_contestants = 100
 num_weeks = 18
 num_teams = 32
 config = Config(num_contestants, num_teams, num_weeks)
@@ -45,37 +45,39 @@ def survivor_game(
     sampled_winning_teams: List[Tuple[int, List[int]]],
 ) -> Tuple[List[PickerNet], int]:
 
-    active_agents = list(agents)
-    contestant_picks = {}
-    weeks_played = 0
-    for week_idx in range(num_weeks):
-        last_week_agents = list(active_agents)
-        contestant_picks_upto_last_week = contestant_picks.copy()
-        winning_team_ids = set(sampled_winning_teams[week_idx][1])
+    with torch.inference_mode():
+        active_agents = list(agents)
+        contestant_picks = {}
+        weeks_played = 0
+        for week_idx in range(num_weeks):
+            last_week_agents = list(active_agents)
+            contestant_picks_upto_last_week = contestant_picks.copy()
+            winning_team_ids = set(sampled_winning_teams[week_idx][1])
 
-        survivors: List[PickerNet] = []
-        for agent in active_agents:
-            pick_dist = agent(
-                contestant_picks=contestant_picks_upto_last_week,
-                matchup_table=schedule.feature_rows,
-                current_week=week_idx,
-            )
-            picked_team_id = int(torch.multinomial(pick_dist, num_samples=1).item())
+            survivors: List[PickerNet] = []
+            mu_table = schedule.feature_rows
+            for agent in active_agents:
+                pick_dist = agent(
+                    contestant_picks=contestant_picks_upto_last_week,
+                    matchup_table=mu_table,
+                    current_week=week_idx,
+                )
+                picked_team_id = int(torch.multinomial(pick_dist, num_samples=1).item())
 
-            if picked_team_id in winning_team_ids:
-                survivors.append(agent)
-                contestant_picks[agent.agent_id] = picked_team_id
-            else:
-                contestant_picks.pop(agent.agent_id, None)
+                if picked_team_id in winning_team_ids:
+                    survivors.append(agent)
+                    contestant_picks[agent.agent_id] = picked_team_id
+                else:
+                    contestant_picks.pop(agent.agent_id, None)
 
-        weeks_played = week_idx + 1
-        if len(survivors) == 0:
-            return last_week_agents, weeks_played
-        if len(survivors) == 1:
-            return survivors, weeks_played
-        active_agents = survivors
+            weeks_played = week_idx + 1
+            if len(survivors) == 0:
+                return last_week_agents, weeks_played
+            if len(survivors) == 1:
+                return survivors, weeks_played
+            active_agents = survivors
 
-    return active_agents, weeks_played
+        return active_agents, weeks_played
 
 
 def replicate_winners(
@@ -145,48 +147,49 @@ def evo_loop(
         population: List[PickerNet],
         profiler: Optional[torch.profiler.profile] = None,
     ) -> List[PickerNet]:
-        loop_iter = tqdm(range(num_loops), desc="Evo loops")
+        with torch.inference_mode():
+            loop_iter = tqdm(range(num_loops), desc="Evo loops")
 
-        for loop_idx in loop_iter:
-            shuffled = list(population)
-            random.shuffle(shuffled)
-            new_all_agents: List[PickerNet] = []
-            game_week_lengths: List[int] = []
+            for loop_idx in loop_iter:
+                shuffled = list(population)
+                random.shuffle(shuffled)
+                new_all_agents: List[PickerNet] = []
+                game_week_lengths: List[int] = []
 
-            generation = tqdm(
-                range(0, len(shuffled), num_contestants),
-                desc=f"Loop {loop_idx + 1}/{num_loops} generation",
-                leave=False,
-            )
-
-            for start in generation:
-                game_agents = shuffled[start:start + num_contestants]
-                sampled_winning_teams = sample_weekly_winners(weekly_probs)
-                winners, weeks_played = survivor_game(game_agents, sampled_winning_teams)
-                game_week_lengths.append(weeks_played)
-
-                replicated = replicate_winners(
-                    winners=winners,
-                    num_contestants=num_contestants,
-                    noise_std=noise_std,
+                generation = tqdm(
+                    range(0, len(shuffled), num_contestants),
+                    desc=f"Loop {loop_idx + 1}/{num_loops} generation",
+                    leave=False,
                 )
-                new_all_agents.extend(replicated)
 
-                if profiler is not None:
-                    profiler.step()
+                for start in generation:
+                    game_agents = shuffled[start:start + num_contestants]
+                    sampled_winning_teams = sample_weekly_winners(weekly_probs)
+                    winners, weeks_played = survivor_game(game_agents, sampled_winning_teams)
+                    game_week_lengths.append(weeks_played)
 
-            for new_id, agent in enumerate(new_all_agents):
-                agent.agent_id = new_id
+                    replicated = replicate_winners(
+                        winners=winners,
+                        num_contestants=num_contestants,
+                        noise_std=noise_std,
+                    )
+                    new_all_agents.extend(replicated)
 
-            avg_week_length = sum(game_week_lengths) / len(game_week_lengths)
-            print(
-                f"Loop {loop_idx + 1}/{num_loops} average game length: "
-                f"{avg_week_length:.2f} weeks"
-            )
+                    if profiler is not None:
+                        profiler.step()
 
-            population = new_all_agents
+                for new_id, agent in enumerate(new_all_agents):
+                    agent.agent_id = new_id
 
-        return population
+                avg_week_length = sum(game_week_lengths) / len(game_week_lengths)
+                print(
+                    f"Loop {loop_idx + 1}/{num_loops} average game length: "
+                    f"{avg_week_length:.2f} weeks"
+                )
+
+                population = new_all_agents
+
+            return population
 
     if profile:
         activities = [torch.profiler.ProfilerActivity.CPU]

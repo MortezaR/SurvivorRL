@@ -19,6 +19,8 @@ def featurize(
     matchup_table: List[MatchupRow],   # [(week_id, team_id, win_prob), ...]
     agent_id: int,                     # contestant_id
     current_week: int,                 # current week index
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """
     Returns a single feature vector x: [D]
@@ -31,34 +33,32 @@ def featurize(
     """
     C, T, W = cfg.num_contestants, cfg.num_teams, cfg.num_weeks
 
-    # pick a device from any tensor input if possible; otherwise CPU
-    device = None
-    for _, _, win_prob in matchup_table:
-        if isinstance(win_prob, torch.Tensor):
-            device = win_prob.device
-            break
+    # If no device is provided, default to GPU.
     if device is None:
-        device = torch.device("cpu")
+        device = torch.device("cuda")
 
     # 1) contestant->picked team matrix: [C, T]
-    picks_mat = torch.zeros((C, T), device=device)
+    picks_mat = torch.zeros((C, T), device=device, dtype=dtype)
     for cid, tid in contestant_picks.items():
         if 0 <= cid < C and 0 <= tid < T:
             picks_mat[cid, tid] = 1.0
 
     # 2) matchup odds table: [W, T]
-    matchup_odds = torch.zeros((W, T), device=device)
+    matchup_odds = torch.zeros((W, T), device=device, dtype=dtype)
     for week_id, team_id, win_prob in matchup_table:
         if 0 <= week_id < W and 0 <= team_id < T:
-            matchup_odds[week_id, team_id] = float(win_prob)
+            if isinstance(win_prob, torch.Tensor):
+                matchup_odds[week_id, team_id] = win_prob.to(device=device, dtype=dtype)
+            else:
+                matchup_odds[week_id, team_id] = float(win_prob)
 
     # 3) agent id one-hot: [C]
-    agent_oh = torch.zeros((C,), device=device)
+    agent_oh = torch.zeros((C,), device=device, dtype=dtype)
     if 0 <= agent_id < C:
         agent_oh[agent_id] = 1.0
 
     # 4) current week one-hot: [W]
-    current_week_oh = torch.zeros((W,), device=device)
+    current_week_oh = torch.zeros((W,), device=device, dtype=dtype)
     if 0 <= current_week < W:
         current_week_oh[current_week] = 1.0
 
@@ -95,13 +95,17 @@ class PickerNet(nn.Module):
         current_week: int,
         unavailable_team_ids: Optional[List[int]] = None,
     ):
+        model_device = self.fc1.weight.device
+        model_dtype = self.fc1.weight.dtype
         x = featurize(
             cfg=self.cfg,
             contestant_picks=contestant_picks,
             matchup_table=matchup_table,
             agent_id=self.agent_id,
             current_week=current_week,
-        ).to(device=self.fc1.weight.device, dtype=self.fc1.weight.dtype)
+            device=model_device,
+            dtype=model_dtype,
+        )
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
         logits = self.fc3(x)

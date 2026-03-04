@@ -7,9 +7,9 @@ import torch.nn as nn
 
 @dataclass
 class Config:
-    max_contestants: int
-    max_teams: int
-    max_weeks: int
+    num_contestants: int
+    num_teams: int
+    num_weeks: int
 
 MatchupRow = Tuple[int, int, float]  # (week_id, team_id, win_probability)
 
@@ -29,7 +29,7 @@ def featurize(
       3) agent_oh: [C] one-hot agent id
       4) current_week: [W] one-hot current week
     """
-    C, T, W = cfg.max_contestants, cfg.max_teams, cfg.max_weeks
+    C, T, W = cfg.num_contestants, cfg.num_teams, cfg.num_weeks
 
     # pick a device from any tensor input if possible; otherwise CPU
     device = None
@@ -73,14 +73,20 @@ def featurize(
 
     return x  # [D]
 
-class BareBonesPickerNet(nn.Module):
-    def __init__(self, input_dim, num_teams, agent_id, feature_cfg: Config):
+class PickerNet(nn.Module):
+    def __init__(self, agent_id, cfg: Config):
         super().__init__()
         self.agent_id = agent_id
-        self.feature_cfg = feature_cfg
-        self.fc1 = nn.Linear(input_dim, 128)
+        self.cfg = cfg
+        self.input_dim = (
+            (cfg.num_contestants * cfg.num_teams)
+            + (cfg.num_weeks * cfg.num_teams)
+            + cfg.num_contestants
+            + cfg.num_weeks
+        )
+        self.fc1 = nn.Linear(self.input_dim, 128)
         self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, num_teams)
+        self.fc3 = nn.Linear(128, cfg.num_teams)
 
     def forward(
         self,
@@ -90,7 +96,7 @@ class BareBonesPickerNet(nn.Module):
         unavailable_team_ids: Optional[List[int]] = None,
     ):
         x = featurize(
-            cfg=self.feature_cfg,
+            cfg=self.cfg,
             contestant_picks=contestant_picks,
             matchup_table=matchup_table,
             agent_id=self.agent_id,
@@ -117,5 +123,5 @@ class BareBonesPickerNet(nn.Module):
     @staticmethod
     def mutated_copy(model: torch.nn.Module, std: float = 0.01):
         child = copy.deepcopy(model)
-        BareBonesPickerNet.add_gaussian_noise(child, std)
+        PickerNet.add_gaussian_noise(child, std)
         return child

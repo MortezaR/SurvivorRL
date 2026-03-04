@@ -5,15 +5,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 
-FeatureMatchupRow = Tuple[int, int, float]  # (week_id, team_id, win_prob)
+MatchupRow = Tuple[int, int, float]  # (week_id, team_id, win_prob)
 
 
 @dataclass
 class CsvSchedule:
-    feature_rows: List[FeatureMatchupRow]
+    feature_rows: List[MatchupRow]
     team_names: List[str]
-    num_weeks: int
-    num_teams: int
 
 
 def _normalize_probability(raw_value: str) -> float:
@@ -51,7 +49,7 @@ def load_schedule_from_csv(
                 f"CSV is missing required week columns {missing_columns} in {path}"
             )
 
-        feature_rows: List[FeatureMatchupRow] = []
+        feature_rows: List[MatchupRow] = []
         team_names: List[str] = []
 
         for team_id, row in enumerate(reader):
@@ -70,7 +68,5 @@ def load_schedule_from_csv(
 
     return CsvSchedule(
         feature_rows=feature_rows,
-        team_names=team_names,
-        num_weeks=num_weeks,
-        num_teams=num_teams,
+        team_names=team_names
     )

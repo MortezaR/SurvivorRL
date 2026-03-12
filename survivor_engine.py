@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import random
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 from tqdm import tqdm
@@ -10,8 +10,8 @@ from tqdm import tqdm
 from survivor_agent import PickerNet, Config
 from survivor_schedule import load_schedule_from_csv
 
-num_agents = 1000
-num_contestants = 100
+num_agents = 100
+num_contestants = 10
 num_weeks = 18
 num_teams = 32
 config = Config(num_contestants, num_teams, num_weeks)
@@ -136,8 +136,6 @@ def evo_loop(
     num_loops: int,
     num_contestants: int,
     noise_std: float = 0.01,
-    profile: bool = False,
-    profile_output_path: Optional[str] = None,
 ) -> List[PickerNet]:
 
     if num_contestants <= 0:
@@ -145,7 +143,6 @@ def evo_loop(
 
     def _run_loop(
         population: List[PickerNet],
-        profiler: Optional[torch.profiler.profile] = None,
     ) -> List[PickerNet]:
         with torch.inference_mode():
             loop_iter = tqdm(range(num_loops), desc="Evo loops")
@@ -175,9 +172,6 @@ def evo_loop(
                     )
                     new_all_agents.extend(replicated)
 
-                    if profiler is not None:
-                        profiler.step()
-
                 for new_id, agent in enumerate(new_all_agents):
                     agent.agent_id = new_id
 
@@ -191,22 +185,7 @@ def evo_loop(
 
             return population
 
-    if profile:
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-        with torch.profiler.profile(activities=activities) as profiler:
-            final_population = _run_loop(all_agents, profiler=profiler)
-
-        if profile_output_path:
-            trace_path = Path(profile_output_path)
-            trace_path.parent.mkdir(parents=True, exist_ok=True)
-            profiler.export_chrome_trace(str(trace_path))
-    else:
-        final_population = _run_loop(all_agents, profiler=None)
-
-    return final_population
+    return _run_loop(all_agents)
         
 
 

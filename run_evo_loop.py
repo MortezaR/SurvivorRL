@@ -35,16 +35,6 @@ if __name__ == "__main__":
         default="checkpoints/picker_population.pt",
     )
     parser.add_argument(
-        "--profile",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    parser.add_argument(
-        "--profile-trace-path",
-        type=str,
-        default="profiles/evo_loop_trace.json",
-    )
-    parser.add_argument(
         "--device",
         type=str,
         choices=["cpu", "cuda"],
@@ -75,8 +65,6 @@ if __name__ == "__main__":
         num_loops=args.num_loops,
         num_contestants=num_contestants,
         noise_std=args.noise_std,
-        profile=args.profile,
-        profile_output_path=args.profile_trace_path,
     )
     print(f"Finished {args.num_loops} evo loop(s).")
     print(f"Population size: {len(evolved_population)}")
@@ -84,6 +72,3 @@ if __name__ == "__main__":
     if args.save:
         save_population_weights(evolved_population, args.weights_path)
         print(f"Saved population to: {args.weights_path}")
-
-    if args.profile:
-        print(f"Profiler trace saved to: {args.profile_trace_path}")

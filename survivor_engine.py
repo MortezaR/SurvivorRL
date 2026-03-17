@@ -47,34 +47,38 @@ def survivor_game(
 
     with torch.inference_mode():
         active_agents = list(agents)
-        contestant_picks = {}
+        contestant_picks = {}  # {agent_id: [picked_team_id, ...]} for active agents only
         weeks_played = 0
         for week_idx in range(num_weeks):
             last_week_agents = list(active_agents)
-            contestant_picks_upto_last_week = contestant_picks.copy()
+            contestant_picks_upto_last_week = {
+                cid: picks.copy() for cid, picks in contestant_picks.items()
+            }
             winning_team_ids = set(sampled_winning_teams[week_idx][1])
 
             survivors: List[PickerNet] = []
+            next_contestant_picks = {}
             mu_table = schedule.feature_rows
             for agent in active_agents:
+                prior_picks = contestant_picks_upto_last_week.get(agent.agent_id, [])
                 pick_dist = agent(
                     contestant_picks=contestant_picks_upto_last_week,
                     matchup_table=mu_table,
                     current_week=week_idx,
+                    unavailable_team_ids=prior_picks,
                 )
                 picked_team_id = int(torch.multinomial(pick_dist, num_samples=1).item())
 
                 if picked_team_id in winning_team_ids:
                     survivors.append(agent)
-                    contestant_picks[agent.agent_id] = picked_team_id
-                else:
-                    contestant_picks.pop(agent.agent_id, None)
+                    next_contestant_picks[agent.agent_id] = prior_picks + [picked_team_id]
 
             weeks_played = week_idx + 1
             if len(survivors) == 0:
                 return last_week_agents, weeks_played
             if len(survivors) == 1:
                 return survivors, weeks_played
+            contestant_picks = next_contestant_picks
             active_agents = survivors
 
         return active_agents, weeks_played

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import random
-from typing import List, Tuple
+import shutil
+from typing import Dict, List, Tuple
 
 import torch
 from tqdm import tqdm
@@ -16,14 +17,147 @@ num_weeks = 18
 num_teams = 32
 config = Config(num_contestants, num_teams, num_weeks)
 
-all_agents = [PickerNet( agent_id, config) for agent_id in range(num_agents)]
-
 schedule = load_schedule_from_csv("cleaned_grid2.csv",num_weeks,num_teams)
 
 weekly_probs = [[] for _ in range(num_weeks)]
 for week_id, team_id, win_prob in schedule.feature_rows:
     team_name = schedule.team_names[team_id]
     weekly_probs[week_id].append((team_name, win_prob))
+
+POPULATION_SIZE_FILENAME = "population_size.txt"
+
+
+def _agent_checkpoint_path(population_dir: Path, agent_index: int) -> Path:
+    return population_dir / f"agent_{agent_index:06d}.pt"
+
+
+def _remove_existing_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+        return
+
+    if path.exists():
+        path.unlink()
+
+
+def _prepare_population_dir(population_dir: Path) -> None:
+    if population_dir.exists():
+        _remove_existing_path(population_dir)
+    population_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _state_dict_to_cpu(state_dict: Dict[str, object]) -> Dict[str, object]:
+    cpu_state_dict: Dict[str, object] = {}
+    for name, value in state_dict.items():
+        if isinstance(value, torch.Tensor):
+            cpu_state_dict[name] = value.detach().cpu()
+        else:
+            cpu_state_dict[name] = value
+    return cpu_state_dict
+
+
+def _write_population_size(population_dir: Path, population_size: int) -> None:
+    (population_dir / POPULATION_SIZE_FILENAME).write_text(f"{population_size}\n")
+
+
+def get_population_store_size(population_dir: str | Path) -> int:
+    return int((Path(population_dir) / POPULATION_SIZE_FILENAME).read_text().strip())
+
+
+def save_agent_checkpoint(
+    agent: PickerNet,
+    population_dir: str | Path,
+    agent_index: int,
+) -> None:
+    population_path = Path(population_dir)
+    payload = {
+        "agent_id": agent.agent_id,
+        "state_dict": _state_dict_to_cpu(agent.state_dict()),
+    }
+    torch.save(payload, _agent_checkpoint_path(population_path, agent_index))
+
+
+def load_agent_checkpoint(
+    population_dir: str | Path,
+    agent_index: int,
+    cfg: Config,
+    device: torch.device,
+) -> PickerNet:
+    population_path = Path(population_dir)
+    payload = torch.load(_agent_checkpoint_path(population_path, agent_index), map_location="cpu")
+    agent_id = payload.get("agent_id", agent_index)
+    agent = PickerNet(agent_id=agent_id, cfg=cfg)
+    agent.load_state_dict(payload["state_dict"])
+    agent.to(device)
+    return agent
+
+
+def initialize_random_population_store(
+    population_dir: str | Path,
+    cfg: Config,
+    population_size: int,
+) -> None:
+    population_path = Path(population_dir)
+    _prepare_population_dir(population_path)
+
+    for agent_idx in range(population_size):
+        agent = PickerNet(agent_id=agent_idx, cfg=cfg)
+        save_agent_checkpoint(agent, population_path, agent_idx)
+
+    _write_population_size(population_path, population_size)
+
+
+def load_population_checkpoint_into_store(
+    checkpoint_path: str,
+    population_dir: str | Path,
+) -> None:
+    checkpoint = Path(checkpoint_path)
+    population_path = Path(population_dir)
+    _prepare_population_dir(population_path)
+
+    if checkpoint.is_dir():
+        shutil.copytree(checkpoint, population_path, dirs_exist_ok=True)
+        return
+
+    payload = torch.load(checkpoint, map_location="cpu")
+    state_dicts = payload["state_dicts"]
+    agent_ids = payload.get("agent_ids", list(range(len(state_dicts))))
+
+    for idx, state_dict in enumerate(state_dicts):
+        agent_id = agent_ids[idx] if idx < len(agent_ids) else idx
+        torch.save(
+            {"agent_id": agent_id, "state_dict": _state_dict_to_cpu(state_dict)},
+            _agent_checkpoint_path(population_path, idx),
+        )
+
+    _write_population_size(population_path, len(state_dicts))
+
+
+def save_population_store(
+    population_dir: str | Path,
+    output_path: str,
+) -> None:
+    population_path = Path(population_dir)
+    path = Path(output_path)
+
+    if path.suffix != ".pt":
+        if path.exists():
+            _remove_existing_path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(population_path, path)
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    population_size = get_population_store_size(population_path)
+    state_dicts = []
+    agent_ids = []
+
+    for agent_idx in range(population_size):
+        payload = torch.load(_agent_checkpoint_path(population_path, agent_idx), map_location="cpu")
+        state_dicts.append(payload["state_dict"])
+        agent_ids.append(payload.get("agent_id", agent_idx))
+
+    torch.save({"state_dicts": state_dicts, "agent_ids": agent_ids}, path)
 
 
 def sample_weekly_winners(
@@ -101,18 +235,39 @@ def replicate_winners(
             replicated.append(child)
 
     return replicated
+
+
 def save_population_weights(population: List[PickerNet], output_path: str) -> None:
+
+    if Path(output_path).suffix != ".pt":
+        population_path = Path(output_path)
+        _prepare_population_dir(population_path)
+
+        for idx, agent in enumerate(population):
+            agent.agent_id = idx
+            save_agent_checkpoint(agent, population_path, idx)
+
+        _write_population_size(population_path, len(population))
+        return
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "state_dicts": [agent.state_dict() for agent in population],
+        "state_dicts": [_state_dict_to_cpu(agent.state_dict()) for agent in population],
         "agent_ids": [agent.agent_id for agent in population],
     }
     torch.save(payload, path)
 
 
 def load_population_weights(weights_path: str, cfg: Config) -> List[PickerNet]:
+
+    weights = Path(weights_path)
+    if weights.is_dir():
+        population_size = get_population_store_size(weights)
+        return [
+            load_agent_checkpoint(weights, agent_idx, cfg, torch.device("cpu"))
+            for agent_idx in range(population_size)
+        ]
 
     payload = torch.load(weights_path, map_location="cpu")
     state_dicts = payload["state_dicts"]
@@ -136,60 +291,75 @@ def move_population_to_device(population: List[PickerNet], device: torch.device)
 
 
 def evo_loop(
-    all_agents: List[PickerNet],
+    population_dir: str | Path,
+    cfg: Config,
     num_loops: int,
     num_contestants: int,
+    device: torch.device,
     noise_std: float = 0.01,
-) -> List[PickerNet]:
+    work_dir: str | Path | None = None,
+) -> Path:
 
     if num_contestants <= 0:
         raise ValueError("num_contestants must be > 0")
 
-    def _run_loop(
-        population: List[PickerNet],
-    ) -> List[PickerNet]:
-        with torch.inference_mode():
-            loop_iter = tqdm(range(num_loops), desc="Evo loops")
+    current_population_dir = Path(population_dir)
+    generation_root = Path(work_dir) if work_dir is not None else current_population_dir.parent
 
-            for loop_idx in loop_iter:
-                shuffled = list(population)
-                random.shuffle(shuffled)
-                new_all_agents: List[PickerNet] = []
-                game_week_lengths: List[int] = []
+    with torch.inference_mode():
+        loop_iter = tqdm(range(num_loops), desc="Evo loops")
 
-                generation = tqdm(
-                    range(0, len(shuffled), num_contestants),
-                    desc=f"Loop {loop_idx + 1}/{num_loops} generation",
-                    leave=False,
+        for loop_idx in loop_iter:
+            population_size = get_population_store_size(current_population_dir)
+            shuffled_indices = list(range(population_size))
+            random.shuffle(shuffled_indices)
+            next_population_dir = generation_root / f"generation_{loop_idx + 1:04d}"
+            _prepare_population_dir(next_population_dir)
+            next_agent_id = 0
+            game_week_lengths: List[int] = []
+
+            generation = tqdm(
+                range(0, population_size, num_contestants),
+                desc=f"Loop {loop_idx + 1}/{num_loops} generation",
+                leave=False,
+            )
+
+            for start in generation:
+                game_agent_indices = shuffled_indices[start:start + num_contestants]
+                game_agents = [
+                    load_agent_checkpoint(current_population_dir, agent_idx, cfg, device)
+                    for agent_idx in game_agent_indices
+                ]
+                sampled_winning_teams = sample_weekly_winners(weekly_probs)
+                winners, weeks_played = survivor_game(game_agents, sampled_winning_teams)
+                game_week_lengths.append(weeks_played)
+
+                replicated = replicate_winners(
+                    winners=winners,
+                    num_contestants=len(game_agent_indices),
+                    noise_std=noise_std,
                 )
 
-                for start in generation:
-                    game_agents = shuffled[start:start + num_contestants]
-                    sampled_winning_teams = sample_weekly_winners(weekly_probs)
-                    winners, weeks_played = survivor_game(game_agents, sampled_winning_teams)
-                    game_week_lengths.append(weeks_played)
+                for agent in replicated:
+                    agent.agent_id = next_agent_id
+                    save_agent_checkpoint(agent, next_population_dir, next_agent_id)
+                    next_agent_id += 1
 
-                    replicated = replicate_winners(
-                        winners=winners,
-                        num_contestants=num_contestants,
-                        noise_std=noise_std,
-                    )
-                    new_all_agents.extend(replicated)
+                del game_agents, winners, replicated
 
-                for new_id, agent in enumerate(new_all_agents):
-                    agent.agent_id = new_id
+            _write_population_size(next_population_dir, next_agent_id)
+            avg_week_length = sum(game_week_lengths) / len(game_week_lengths)
+            print(
+                f"Loop {loop_idx + 1}/{num_loops} average game length: "
+                f"{avg_week_length:.2f} weeks"
+            )
 
-                avg_week_length = sum(game_week_lengths) / len(game_week_lengths)
-                print(
-                    f"Loop {loop_idx + 1}/{num_loops} average game length: "
-                    f"{avg_week_length:.2f} weeks"
-                )
+            if current_population_dir != Path(population_dir):
+                shutil.rmtree(current_population_dir)
 
-                population = new_all_agents
+            current_population_dir = next_population_dir
 
-            return population
-
-    return _run_loop(all_agents)
+    return current_population_dir
         
 
 

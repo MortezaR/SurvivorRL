@@ -5,6 +5,8 @@ from typing import Dict, List, Mapping, Optional, Tuple
 import torch
 import torch.nn as nn
 
+MODEL_DTYPE = torch.float16
+
 @dataclass
 class Config:
     num_contestants: int
@@ -22,7 +24,7 @@ def featurize(
     current_week: int,                 # current week index
     num_players: [int],
     device: Optional[torch.device] = None,
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype = MODEL_DTYPE,
 ) -> torch.Tensor:
     """
     Returns a single feature vector x: [D]
@@ -86,7 +88,7 @@ def build_matchup_odds_tensor(
     cfg: Config,
     matchup_table: List[MatchupRow],
     device: Optional[torch.device] = None,
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype = MODEL_DTYPE,
 ) -> torch.Tensor:
     """
     Returns matchup odds as [W, T] using the same layout as featurize().
@@ -113,7 +115,7 @@ def featurize_population(
     matchup_odds: torch.Tensor,             # [W, T]
     current_week: int,
     num_players: int,
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype = MODEL_DTYPE,
 ) -> torch.Tensor:
     """
     Batched version of featurize() that preserves the same feature layout.
@@ -232,6 +234,7 @@ class PickerNet(nn.Module):
         self.fc1 = nn.Linear(self.input_dim, 128)
         self.fc2 = nn.Linear(128, 128)
         self.fc3 = nn.Linear(128, cfg.num_teams)
+        self.to(dtype=MODEL_DTYPE)
 
     def forward(
         self,

@@ -12,6 +12,7 @@ from tqdm import tqdm
 from survivor_agent import (
     PickerNet,
     Config,
+    MODEL_DTYPE,
     build_matchup_odds_tensor,
     population_policy_forward,
 )
@@ -55,7 +56,10 @@ class PopulationStore:
 
         self.agent_ids = self.agent_ids.to(dtype=torch.long, device="cpu")
         for name, tensor in self.parameter_tensors.items():
-            self.parameter_tensors[name] = tensor.detach().to(device="cpu")
+            self.parameter_tensors[name] = tensor.detach().to(
+                device="cpu",
+                dtype=MODEL_DTYPE,
+            )
 
     def __len__(self) -> int:
 
@@ -94,7 +98,7 @@ class PopulationStore:
             }
         else:
             parameter_tensors = {
-                name: torch.empty((num_agents, *tensor.shape), dtype=tensor.dtype)
+                name: torch.empty((num_agents, *tensor.shape), dtype=MODEL_DTYPE)
                 for name, tensor in template_state.items()
             }
 
@@ -160,7 +164,7 @@ class PopulationStore:
                 raise ValueError("Invalid checkpoint: parameter_tensors must be a dict.")
 
             parameter_tensors = {
-                name: tensor.detach().to(device="cpu")
+                name: tensor.detach().to(device="cpu", dtype=MODEL_DTYPE)
                 for name, tensor in raw_parameter_tensors.items()
             }
             first_tensor = next(iter(parameter_tensors.values()), None)
@@ -183,12 +187,14 @@ class PopulationStore:
 
         first_state = state_dicts[0]
         parameter_tensors = {
-            name: torch.empty((len(state_dicts), *tensor.shape), dtype=tensor.dtype)
+            name: torch.empty((len(state_dicts), *tensor.shape), dtype=MODEL_DTYPE)
             for name, tensor in first_state.items()
         }
         for idx, state_dict in enumerate(state_dicts):
             for name, tensor in state_dict.items():
-                parameter_tensors[name][idx].copy_(tensor.detach().to(device="cpu"))
+                parameter_tensors[name][idx].copy_(
+                    tensor.detach().to(device="cpu", dtype=MODEL_DTYPE)
+                )
 
         raw_agent_ids = payload.get("agent_ids", list(range(len(state_dicts))))
         agent_ids = torch.as_tensor(raw_agent_ids, dtype=torch.long).clone()

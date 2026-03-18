@@ -165,6 +165,11 @@ def _stacked_linear(
     return torch.bmm(weight, x.unsqueeze(-1)).squeeze(-1) + bias
 
 
+def _masked_logit_fill_value(logits: torch.Tensor) -> float:
+
+    return torch.finfo(logits.dtype).min
+
+
 def population_policy_forward(
     cfg: Config,
     parameter_tensors: Mapping[str, torch.Tensor],
@@ -217,7 +222,10 @@ def population_policy_forward(
         rows_with_available_teams = ~blocked_mask.all(dim=1, keepdim=True)
         effective_blocked_mask = blocked_mask & rows_with_available_teams
         if effective_blocked_mask.any():
-            logits = logits.masked_fill(effective_blocked_mask, -1e9)
+            logits = logits.masked_fill(
+                effective_blocked_mask,
+                _masked_logit_fill_value(logits),
+            )
 
     return torch.softmax(logits, dim=-1)
 
@@ -263,7 +271,7 @@ class PickerNet(nn.Module):
             blocked = [tid for tid in unavailable_team_ids if 0 <= tid < logits.shape[-1]]
             if blocked and len(blocked) < logits.shape[-1]:
                 logits = logits.clone()
-                logits[blocked] = -1e9
+                logits[blocked] = _masked_logit_fill_value(logits)
         return torch.softmax(logits, dim=-1)
 
     @staticmethod

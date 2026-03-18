@@ -12,7 +12,7 @@ from tqdm import tqdm
 from survivor_agent import PickerNet, Config
 from survivor_schedule import load_schedule_from_csv
 
-num_agents = 10000
+num_agents = 1000000
 num_contestants = 1000
 num_weeks = 18
 num_teams = 32

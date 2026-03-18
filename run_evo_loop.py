@@ -41,8 +41,16 @@ if __name__ == "__main__":
         default="cuda",
         help="Run model inference/evolution on this device.",
     )
+    parser.add_argument(
+        "--game-workers",
+        type=int,
+        default=None,
+        help="Number of concurrent game workers. Defaults to 2 on CUDA and 1 on CPU.",
+    )
     args = parser.parse_args()
 
+    if args.game_workers is not None and args.game_workers < 1:
+        raise ValueError("--game-workers must be >= 1 when provided.")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA requested but not available. Use --device cpu.")
     runtime_device = torch.device(args.device)
@@ -65,6 +73,7 @@ if __name__ == "__main__":
         num_loops=args.num_loops,
         num_contestants=num_contestants,
         noise_std=args.noise_std,
+        game_workers=args.game_workers,
     )
     print(f"Finished {args.num_loops} evo loop(s).")
     print(f"Population size: {len(evolved_population)}")

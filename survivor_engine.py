@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 import random
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -24,6 +26,20 @@ weekly_probs = [[] for _ in range(num_weeks)]
 for week_id, team_id, win_prob in schedule.feature_rows:
     team_name = schedule.team_names[team_id]
     weekly_probs[week_id].append((team_name, win_prob))
+
+
+@dataclass
+class GameWorkItem:
+    game_idx: int
+    agents: List[PickerNet]
+    sampled_winning_teams: List[Tuple[int, List[int]]]
+
+
+@dataclass
+class GameWorkResult:
+    game_idx: int
+    replicated_agents: List[PickerNet]
+    weeks_played: int
 
 
 def sample_weekly_winners(
@@ -68,7 +84,9 @@ def survivor_game(
                     num_players=len(active_agents),
                     unavailable_team_ids=prior_picks,
                 )
-                picked_team_id = int(torch.multinomial(pick_dist, num_samples=1).item())
+                picked_team_id = int(
+                    torch.multinomial(pick_dist, num_samples=1).item()
+                )
 
                 if picked_team_id in winning_team_ids:
                     survivors.append(agent)
@@ -136,46 +154,157 @@ def move_population_to_device(population: List[PickerNet], device: torch.device)
     return population
 
 
+def _population_device(population: List[PickerNet]) -> torch.device:
+
+    if not population:
+        return torch.device("cpu")
+    return next(population[0].parameters()).device
+
+
+def _run_game_work_item(
+    work_item: GameWorkItem,
+    num_contestants: int,
+    noise_std: float,
+    device: torch.device,
+) -> GameWorkResult:
+
+    if device.type == "cuda":
+        stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(stream), torch.inference_mode():
+            winners, weeks_played = survivor_game(
+                work_item.agents,
+                work_item.sampled_winning_teams,
+            )
+            replicated_agents = replicate_winners(
+                winners=winners,
+                num_contestants=num_contestants,
+                noise_std=noise_std,
+            )
+        stream.synchronize()
+    else:
+        with torch.inference_mode():
+            winners, weeks_played = survivor_game(
+                work_item.agents,
+                work_item.sampled_winning_teams,
+            )
+            replicated_agents = replicate_winners(
+                winners=winners,
+                num_contestants=num_contestants,
+                noise_std=noise_std,
+            )
+
+    return GameWorkResult(
+        game_idx=work_item.game_idx,
+        replicated_agents=replicated_agents,
+        weeks_played=weeks_played,
+    )
+
+
+class GameDispatcher:
+    def __init__(
+        self,
+        device: torch.device,
+        max_workers: Optional[int] = None,
+    ) -> None:
+
+        self.device = device
+        default_workers = 2 if device.type == "cuda" else 1
+        self.max_workers = default_workers if max_workers is None else max_workers
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.max_workers,
+            thread_name_prefix="gpu-game-worker",
+        )
+
+    def run_generation(
+        self,
+        work_items: List[GameWorkItem],
+        num_contestants: int,
+        noise_std: float,
+        desc: str,
+    ) -> List[GameWorkResult]:
+
+        futures = [
+            self._executor.submit(
+                _run_game_work_item,
+                work_item,
+                num_contestants,
+                noise_std,
+                self.device,
+            )
+            for work_item in work_items
+        ]
+        ordered_results: List[Optional[GameWorkResult]] = [None] * len(work_items)
+        generation = tqdm(total=len(futures), desc=desc, leave=False)
+
+        try:
+            for future in as_completed(futures):
+                result = future.result()
+                ordered_results[result.game_idx] = result
+                generation.update(1)
+        except Exception:
+            for future in futures:
+                future.cancel()
+            raise
+        finally:
+            generation.close()
+
+        return [result for result in ordered_results if result is not None]
+
+    def close(self) -> None:
+
+        self._executor.shutdown(wait=True)
+
+
 def evo_loop(
     all_agents: List[PickerNet],
     num_loops: int,
     num_contestants: int,
     noise_std: float = 0.01,
+    game_workers: Optional[int] = None,
 ) -> List[PickerNet]:
 
     if num_contestants <= 0:
         raise ValueError("num_contestants must be > 0")
+    if game_workers is not None and game_workers < 1:
+        raise ValueError("game_workers must be >= 1 when provided.")
 
     def _run_loop(
         population: List[PickerNet],
     ) -> List[PickerNet]:
-        with torch.inference_mode():
+        dispatcher = GameDispatcher(
+            device=_population_device(population),
+            max_workers=game_workers,
+        )
+        try:
             loop_iter = tqdm(range(num_loops), desc="Evo loops")
 
             for loop_idx in loop_iter:
                 shuffled = list(population)
                 random.shuffle(shuffled)
-                new_all_agents: List[PickerNet] = []
-                game_week_lengths: List[int] = []
+                work_items: List[GameWorkItem] = []
 
-                generation = tqdm(
-                    range(0, len(shuffled), num_contestants),
+                for game_idx, start in enumerate(range(0, len(shuffled), num_contestants)):
+                    game_agents = shuffled[start:start + num_contestants]
+                    work_items.append(
+                        GameWorkItem(
+                            game_idx=game_idx,
+                            agents=game_agents,
+                            sampled_winning_teams=sample_weekly_winners(weekly_probs),
+                        )
+                    )
+
+                results = dispatcher.run_generation(
+                    work_items=work_items,
+                    num_contestants=num_contestants,
+                    noise_std=noise_std,
                     desc=f"Loop {loop_idx + 1}/{num_loops} generation",
-                    leave=False,
                 )
 
-                for start in generation:
-                    game_agents = shuffled[start:start + num_contestants]
-                    sampled_winning_teams = sample_weekly_winners(weekly_probs)
-                    winners, weeks_played = survivor_game(game_agents, sampled_winning_teams)
-                    game_week_lengths.append(weeks_played)
-
-                    replicated = replicate_winners(
-                        winners=winners,
-                        num_contestants=num_contestants,
-                        noise_std=noise_std,
-                    )
-                    new_all_agents.extend(replicated)
+                new_all_agents: List[PickerNet] = []
+                game_week_lengths: List[int] = []
+                for result in results:
+                    game_week_lengths.append(result.weeks_played)
+                    new_all_agents.extend(result.replicated_agents)
 
                 for new_id, agent in enumerate(new_all_agents):
                     agent.agent_id = new_id
@@ -189,6 +318,8 @@ def evo_loop(
                 population = new_all_agents
 
             return population
+        finally:
+            dispatcher.close()
 
     return _run_loop(all_agents)
         

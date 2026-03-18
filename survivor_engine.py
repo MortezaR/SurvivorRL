@@ -12,7 +12,7 @@ from tqdm import tqdm
 from survivor_agent import PickerNet, Config
 from survivor_schedule import load_schedule_from_csv
 
-num_agents = 100
+num_agents = 10000
 num_contestants = 10
 num_weeks = 18
 num_teams = 32
@@ -167,24 +167,26 @@ def _run_game_work_item(
     noise_std: float,
     device: torch.device,
 ) -> GameWorkResult:
+    game_agents = move_population_to_device(work_item.agents, device)
 
     if device.type == "cuda":
-        stream = torch.cuda.Stream(device=device)
-        with torch.cuda.stream(stream), torch.inference_mode():
-            winners, weeks_played = survivor_game(
-                work_item.agents,
-                work_item.sampled_winning_teams,
-            )
-            replicated_agents = replicate_winners(
-                winners=winners,
-                num_contestants=num_contestants,
-                noise_std=noise_std,
-            )
-        stream.synchronize()
+        with torch.cuda.device(device):
+            stream = torch.cuda.Stream(device=device)
+            with torch.cuda.stream(stream), torch.inference_mode():
+                winners, weeks_played = survivor_game(
+                    game_agents,
+                    work_item.sampled_winning_teams,
+                )
+                replicated_agents = replicate_winners(
+                    winners=winners,
+                    num_contestants=num_contestants,
+                    noise_std=noise_std,
+                )
+            stream.synchronize()
     else:
         with torch.inference_mode():
             winners, weeks_played = survivor_game(
-                work_item.agents,
+                game_agents,
                 work_item.sampled_winning_teams,
             )
             replicated_agents = replicate_winners(
@@ -203,16 +205,19 @@ def _run_game_work_item(
 class GameDispatcher:
     def __init__(
         self,
-        device: torch.device,
+        devices: List[torch.device],
         max_workers: Optional[int] = None,
     ) -> None:
 
-        self.device = device
-        default_workers = 2 if device.type == "cuda" else 1
+        if not devices:
+            raise ValueError("GameDispatcher requires at least one dispatch device.")
+        self.devices = [torch.device(device) for device in devices]
+        has_cuda = any(device.type == "cuda" for device in self.devices)
+        default_workers = 2 * len(self.devices) if has_cuda else 1
         self.max_workers = default_workers if max_workers is None else max_workers
         self._executor = ThreadPoolExecutor(
             max_workers=self.max_workers,
-            thread_name_prefix="gpu-game-worker",
+            thread_name_prefix="game-dispatcher",
         )
 
     def run_generation(
@@ -223,13 +228,16 @@ class GameDispatcher:
         desc: str,
     ) -> List[GameWorkResult]:
 
+        if not work_items:
+            return []
+
         futures = [
             self._executor.submit(
                 _run_game_work_item,
                 work_item,
                 num_contestants,
                 noise_std,
-                self.device,
+                self.devices[work_item.game_idx % len(self.devices)],
             )
             for work_item in work_items
         ]
@@ -261,18 +269,26 @@ def evo_loop(
     num_contestants: int,
     noise_std: float = 0.01,
     game_workers: Optional[int] = None,
+    dispatch_devices: Optional[List[torch.device]] = None,
 ) -> List[PickerNet]:
 
     if num_contestants <= 0:
         raise ValueError("num_contestants must be > 0")
     if game_workers is not None and game_workers < 1:
         raise ValueError("game_workers must be >= 1 when provided.")
+    if dispatch_devices is not None and not dispatch_devices:
+        raise ValueError("dispatch_devices must not be empty when provided.")
 
     def _run_loop(
         population: List[PickerNet],
     ) -> List[PickerNet]:
+        devices = (
+            [torch.device(device) for device in dispatch_devices]
+            if dispatch_devices is not None
+            else [_population_device(population)]
+        )
         dispatcher = GameDispatcher(
-            device=_population_device(population),
+            devices=devices,
             max_workers=game_workers,
         )
         try:

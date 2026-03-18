@@ -13,6 +13,35 @@ from survivor_engine import (
     save_population_weights,
 )
 
+
+def resolve_dispatch_devices(device_arg: str) -> list[torch.device]:
+    if device_arg == "cpu":
+        return [torch.device("cpu")]
+
+    try:
+        requested_device = torch.device(device_arg)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"Unsupported device '{device_arg}'. Use 'cpu', 'cuda', or 'cuda:N'."
+        ) from exc
+
+    if requested_device.type != "cuda":
+        raise ValueError(
+            f"Unsupported device '{device_arg}'. Use 'cpu', 'cuda', or 'cuda:N'."
+        )
+    if not torch.cuda.is_available():
+        raise ValueError("CUDA requested but not available. Use --device cpu.")
+
+    device_count = torch.cuda.device_count()
+    if requested_device.index is None:
+        return [torch.device(f"cuda:{idx}") for idx in range(device_count)]
+    if requested_device.index < 0 or requested_device.index >= device_count:
+        raise ValueError(
+            f"CUDA device index {requested_device.index} is out of range for {device_count} visible GPU(s)."
+        )
+    return [requested_device]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run SurvivorRL evolution loop.")
     parser.add_argument("--num-loops", type=int, default=10)
@@ -37,23 +66,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--device",
         type=str,
-        choices=["cpu", "cuda"],
         default="cuda",
-        help="Run model inference/evolution on this device.",
+        help="Run on 'cpu', one GPU via 'cuda:N', or all visible GPUs via 'cuda'.",
     )
     parser.add_argument(
         "--game-workers",
         type=int,
         default=None,
-        help="Number of concurrent game workers. Defaults to 2 on CUDA and 1 on CPU.",
+        help="Number of concurrent game workers. Defaults to 2 per CUDA device and 1 on CPU.",
     )
     args = parser.parse_args()
 
     if args.game_workers is not None and args.game_workers < 1:
         raise ValueError("--game-workers must be >= 1 when provided.")
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA requested but not available. Use --device cpu.")
-    runtime_device = torch.device(args.device)
+    dispatch_devices = resolve_dispatch_devices(args.device)
+    runtime_device = dispatch_devices[0]
 
     population = list(all_agents)
     if args.load:
@@ -66,7 +93,10 @@ if __name__ == "__main__":
             print("Starting from initialized population.")
 
     population = move_population_to_device(population, runtime_device)
-    print(f"Using device: {runtime_device}")
+    if len(dispatch_devices) == 1:
+        print(f"Using device: {runtime_device}")
+    else:
+        print("Using devices: " + ", ".join(str(device) for device in dispatch_devices))
 
     evolved_population = evo_loop(
         all_agents=population,
@@ -74,6 +104,7 @@ if __name__ == "__main__":
         num_contestants=num_contestants,
         noise_std=args.noise_std,
         game_workers=args.game_workers,
+        dispatch_devices=dispatch_devices,
     )
     print(f"Finished {args.num_loops} evo loop(s).")
     print(f"Population size: {len(evolved_population)}")

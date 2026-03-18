@@ -9,7 +9,12 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from tqdm import tqdm
 
-from survivor_agent import PickerNet, Config
+from survivor_agent import (
+    PickerNet,
+    Config,
+    build_matchup_odds_tensor,
+    population_policy_forward,
+)
 from survivor_schedule import load_schedule_from_csv
 
 num_agents = 1000000
@@ -19,6 +24,11 @@ num_teams = 32
 config = Config(num_contestants, num_teams, num_weeks)
 
 schedule = load_schedule_from_csv("cleaned_grid2.csv", num_weeks, num_teams)
+matchup_odds_cpu = build_matchup_odds_tensor(
+    config,
+    schedule.feature_rows,
+    device=torch.device("cpu"),
+)
 
 weekly_probs = [[] for _ in range(num_weeks)]
 for week_id, team_id, win_prob in schedule.feature_rows:
@@ -231,6 +241,23 @@ class PopulationStore:
             agents.append(agent)
         return agents
 
+    def materialize_parameter_shard(
+        self,
+        indices: List[int],
+        device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+
+        index_tensor = torch.as_tensor(indices, dtype=torch.long)
+        return {
+            name: tensor.index_select(0, index_tensor).to(device=device)
+            for name, tensor in self.parameter_tensors.items()
+        }
+
+    def slice_agent_ids(self, indices: List[int]) -> torch.Tensor:
+
+        index_tensor = torch.as_tensor(indices, dtype=torch.long)
+        return self.agent_ids.index_select(0, index_tensor).clone()
+
     def reset_agent_ids(self) -> None:
 
         self.agent_ids = torch.arange(len(self), dtype=torch.long)
@@ -317,6 +344,71 @@ def survivor_game(
         return active_agents, weeks_played
 
 
+def survivor_game_batched(
+    cfg: Config,
+    parameter_tensors: Dict[str, torch.Tensor],
+    sampled_winning_teams: List[Tuple[int, List[int]]],
+    matchup_odds: torch.Tensor,
+) -> Tuple[torch.Tensor, int]:
+
+    with torch.inference_mode():
+        device = parameter_tensors["fc1.weight"].device
+        active_rows = torch.arange(
+            parameter_tensors["fc1.weight"].shape[0],
+            device=device,
+            dtype=torch.long,
+        )
+        pick_history = torch.zeros(
+            (active_rows.numel(), cfg.num_teams),
+            device=device,
+            dtype=torch.bool,
+        )
+        weeks_played = 0
+
+        for week_idx in range(num_weeks):
+            last_active_rows = active_rows
+            winning_team_ids = sampled_winning_teams[week_idx][1]
+            winning_team_mask = torch.zeros(
+                (cfg.num_teams,),
+                device=device,
+                dtype=torch.bool,
+            )
+            if winning_team_ids:
+                winning_team_mask[winning_team_ids] = True
+
+            pick_dist = population_policy_forward(
+                cfg=cfg,
+                parameter_tensors=parameter_tensors,
+                active_indices=active_rows,
+                contestant_pick_history=pick_history,
+                matchup_odds=matchup_odds,
+                current_week=week_idx,
+                num_players=int(active_rows.numel()),
+                unavailable_team_mask=pick_history,
+            )
+            picked_team_ids = torch.multinomial(pick_dist, num_samples=1).squeeze(1)
+            survivor_mask = winning_team_mask[picked_team_ids]
+
+            weeks_played = week_idx + 1
+            if not bool(survivor_mask.any()):
+                return last_active_rows.detach().cpu(), weeks_played
+
+            next_active_rows = active_rows[survivor_mask]
+            next_pick_history = pick_history[survivor_mask].clone()
+            next_pick_history[
+                torch.arange(next_pick_history.shape[0], device=device),
+                picked_team_ids[survivor_mask],
+            ] = True
+
+            if next_active_rows.numel() == 1:
+                return next_active_rows.detach().cpu(), weeks_played
+
+            active_rows = next_active_rows
+            pick_history = next_pick_history
+
+        return active_rows.detach().cpu(), weeks_played
+
+
 def replicate_winners(
     winners: List[PickerNet],
     num_contestants: int,
@@ -334,6 +426,53 @@ def replicate_winners(
             replicated.append(child)
 
     return replicated
+
+
+def replicate_winner_rows(
+    cfg: Config,
+    parameter_tensors: Dict[str, torch.Tensor],
+    agent_ids: torch.Tensor,
+    winner_rows: torch.Tensor,
+    num_contestants: int,
+    noise_std: float = 0.01,
+) -> PopulationStore:
+
+    num_winners = int(winner_rows.numel())
+    if num_winners == 0:
+        raise ValueError("winner_rows must contain at least one winner.")
+
+    device = parameter_tensors["fc1.weight"].device
+    winner_rows = winner_rows.to(device=device, dtype=torch.long)
+
+    base_copies = num_contestants // num_winners
+    remainder = num_contestants % num_winners
+    copy_counts = torch.full(
+        (num_winners,),
+        base_copies,
+        device=device,
+        dtype=torch.long,
+    )
+    if remainder > 0:
+        copy_counts[:remainder] += 1
+
+    replicated_rows = torch.repeat_interleave(winner_rows, copy_counts)
+    replicated_agent_ids = agent_ids.index_select(
+        0,
+        replicated_rows.detach().cpu(),
+    )
+
+    replicated_parameters = {}
+    for name, tensor in parameter_tensors.items():
+        replicated_tensor = tensor.index_select(0, replicated_rows).clone()
+        if noise_std != 0.0:
+            replicated_tensor.add_(torch.randn_like(replicated_tensor) * noise_std)
+        replicated_parameters[name] = replicated_tensor
+
+    return PopulationStore(
+        cfg=cfg,
+        parameter_tensors=replicated_parameters,
+        agent_ids=replicated_agent_ids,
+    )
 
 
 def save_population_weights(population: PopulationStore, output_path: str) -> None:
@@ -356,41 +495,55 @@ def _run_game_work_item(
     noise_std: float,
     device: torch.device,
 ) -> GameWorkResult:
-
-    game_agents = population.materialize_agents(work_item.agent_indices, device)
+    parameter_shard = population.materialize_parameter_shard(
+        work_item.agent_indices,
+        device,
+    )
+    shard_agent_ids = population.slice_agent_ids(work_item.agent_indices)
+    matchup_odds = matchup_odds_cpu.to(
+        device=device,
+        dtype=parameter_shard["fc1.weight"].dtype,
+    )
 
     if device.type == "cuda":
         with torch.cuda.device(device):
             stream = torch.cuda.Stream(device=device)
             with torch.cuda.stream(stream), torch.inference_mode():
-                winners, weeks_played = survivor_game(
-                    game_agents,
-                    work_item.sampled_winning_teams,
+                winner_rows, weeks_played = survivor_game_batched(
+                    cfg=population.cfg,
+                    parameter_tensors=parameter_shard,
+                    sampled_winning_teams=work_item.sampled_winning_teams,
+                    matchup_odds=matchup_odds,
                 )
-                replicated_agents = replicate_winners(
-                    winners=winners,
+                population_shard = replicate_winner_rows(
+                    cfg=population.cfg,
+                    parameter_tensors=parameter_shard,
+                    agent_ids=shard_agent_ids,
+                    winner_rows=winner_rows,
                     num_contestants=num_contestants,
                     noise_std=noise_std,
                 )
             stream.synchronize()
     else:
         with torch.inference_mode():
-            winners, weeks_played = survivor_game(
-                game_agents,
-                work_item.sampled_winning_teams,
+            winner_rows, weeks_played = survivor_game_batched(
+                cfg=population.cfg,
+                parameter_tensors=parameter_shard,
+                sampled_winning_teams=work_item.sampled_winning_teams,
+                matchup_odds=matchup_odds,
             )
-            replicated_agents = replicate_winners(
-                winners=winners,
+            population_shard = replicate_winner_rows(
+                cfg=population.cfg,
+                parameter_tensors=parameter_shard,
+                agent_ids=shard_agent_ids,
+                winner_rows=winner_rows,
                 num_contestants=num_contestants,
                 noise_std=noise_std,
             )
 
     return GameWorkResult(
         game_idx=work_item.game_idx,
-        population_shard=PopulationStore.from_agents(
-            replicated_agents,
-            cfg=population.cfg,
-        ),
+        population_shard=population_shard,
         weeks_played=weeks_played,
     )
 

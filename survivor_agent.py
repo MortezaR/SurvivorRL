@@ -1,6 +1,6 @@
 import copy
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -80,6 +80,144 @@ def featurize(
     ], dim=0)
 
     return x  # [D]
+
+
+def build_matchup_odds_tensor(
+    cfg: Config,
+    matchup_table: List[MatchupRow],
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    Returns matchup odds as [W, T] using the same layout as featurize().
+    """
+
+    T, W = cfg.num_teams, cfg.num_weeks
+    if device is None:
+        device = torch.device("cuda")
+
+    matchup_odds = torch.zeros((W, T), device=device, dtype=dtype)
+    for week_id, team_id, win_prob in matchup_table:
+        if 0 <= week_id < W and 0 <= team_id < T:
+            if isinstance(win_prob, torch.Tensor):
+                matchup_odds[week_id, team_id] = win_prob.to(device=device, dtype=dtype)
+            else:
+                matchup_odds[week_id, team_id] = float(win_prob)
+
+    return matchup_odds
+
+
+def featurize_population(
+    cfg: Config,
+    contestant_pick_history: torch.Tensor,  # [B, T], bool or float
+    matchup_odds: torch.Tensor,             # [W, T]
+    current_week: int,
+    num_players: int,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    Batched version of featurize() that preserves the same feature layout.
+    """
+
+    batch_size = contestant_pick_history.shape[0]
+    device = matchup_odds.device
+
+    self_picks = contestant_pick_history.to(device=device, dtype=dtype)
+    if batch_size > 1:
+        other_pick_totals = self_picks.sum(dim=0, keepdim=True) - self_picks
+        other_picks = other_pick_totals / float(batch_size - 1)
+    else:
+        other_picks = torch.zeros_like(self_picks)
+
+    current_week_oh = torch.zeros((1, cfg.num_weeks), device=device, dtype=dtype)
+    if 0 <= current_week < cfg.num_weeks:
+        current_week_oh[0, current_week] = 1.0
+
+    matchup_features = matchup_odds.reshape(1, -1).expand(batch_size, -1)
+    week_features = current_week_oh.expand(batch_size, -1)
+    num_players_feature = torch.full(
+        (batch_size, 1),
+        float(num_players),
+        device=device,
+        dtype=dtype,
+    )
+
+    return torch.cat(
+        [
+            self_picks,
+            other_picks,
+            matchup_features,
+            week_features,
+            num_players_feature,
+        ],
+        dim=1,
+    )
+
+
+def _stacked_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+
+    return torch.bmm(weight, x.unsqueeze(-1)).squeeze(-1) + bias
+
+
+def population_policy_forward(
+    cfg: Config,
+    parameter_tensors: Mapping[str, torch.Tensor],
+    active_indices: torch.Tensor,
+    contestant_pick_history: torch.Tensor,  # [B, T]
+    matchup_odds: torch.Tensor,             # [W, T]
+    current_week: int,
+    num_players: int,
+    unavailable_team_mask: torch.Tensor,    # [B, T]
+) -> torch.Tensor:
+    """
+    Batched equivalent of PickerNet.forward() over a slice of population tensors.
+    """
+
+    model_device = parameter_tensors["fc1.weight"].device
+    model_dtype = parameter_tensors["fc1.weight"].dtype
+    row_indices = active_indices.to(device=model_device, dtype=torch.long)
+
+    x = featurize_population(
+        cfg=cfg,
+        contestant_pick_history=contestant_pick_history,
+        matchup_odds=matchup_odds,
+        current_week=current_week,
+        num_players=num_players,
+        dtype=model_dtype,
+    )
+
+    hidden_1 = torch.relu(
+        _stacked_linear(
+            x,
+            parameter_tensors["fc1.weight"].index_select(0, row_indices),
+            parameter_tensors["fc1.bias"].index_select(0, row_indices),
+        )
+    )
+    hidden_2 = torch.relu(
+        _stacked_linear(
+            hidden_1,
+            parameter_tensors["fc2.weight"].index_select(0, row_indices),
+            parameter_tensors["fc2.bias"].index_select(0, row_indices),
+        )
+    )
+    logits = _stacked_linear(
+        hidden_2,
+        parameter_tensors["fc3.weight"].index_select(0, row_indices),
+        parameter_tensors["fc3.bias"].index_select(0, row_indices),
+    )
+
+    blocked_mask = unavailable_team_mask.to(device=model_device, dtype=torch.bool)
+    if blocked_mask.numel() > 0:
+        rows_with_available_teams = ~blocked_mask.all(dim=1, keepdim=True)
+        effective_blocked_mask = blocked_mask & rows_with_available_teams
+        if effective_blocked_mask.any():
+            logits = logits.masked_fill(effective_blocked_mask, -1e9)
+
+    return torch.softmax(logits, dim=-1)
 
 class PickerNet(nn.Module):
     def __init__(self, agent_id, cfg: Config):

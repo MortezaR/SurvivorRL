@@ -71,7 +71,12 @@ class PopulationStore:
         )
 
     @classmethod
-    def initialize(cls, num_agents: int, cfg: Config) -> PopulationStore:
+    def initialize(
+        cls,
+        num_agents: int,
+        cfg: Config,
+        identical_models: bool = True,
+    ) -> PopulationStore:
 
         if num_agents < 0:
             raise ValueError("num_agents must be >= 0")
@@ -79,22 +84,30 @@ class PopulationStore:
             return cls.empty(cfg)
 
         template_state = PickerNet(agent_id=0, cfg=cfg).state_dict()
-        parameter_tensors = {
-            name: torch.empty((num_agents, *tensor.shape), dtype=tensor.dtype)
-            for name, tensor in template_state.items()
-        }
         agent_ids = torch.arange(num_agents, dtype=torch.long)
 
-        init_iter = tqdm(
-            range(num_agents),
-            desc="Initializing population",
-            leave=False,
-        )
-        for agent_id in init_iter:
-            agent = PickerNet(agent_id=agent_id, cfg=cfg)
-            state_dict = agent.state_dict()
-            for name, tensor in state_dict.items():
-                parameter_tensors[name][agent_id].copy_(tensor.detach())
+        if identical_models:
+            base_state = PickerNet(agent_id=0, cfg=cfg).state_dict()
+            parameter_tensors = {
+                name: tensor.unsqueeze(0).repeat(num_agents, *([1] * tensor.ndim))
+                for name, tensor in base_state.items()
+            }
+        else:
+            parameter_tensors = {
+                name: torch.empty((num_agents, *tensor.shape), dtype=tensor.dtype)
+                for name, tensor in template_state.items()
+            }
+
+            init_iter = tqdm(
+                range(num_agents),
+                desc="Initializing population",
+                leave=False,
+            )
+            for agent_id in init_iter:
+                agent = PickerNet(agent_id=agent_id, cfg=cfg)
+                state_dict = agent.state_dict()
+                for name, tensor in state_dict.items():
+                    parameter_tensors[name][agent_id].copy_(tensor.detach())
 
         return cls(
             cfg=cfg,
@@ -280,9 +293,14 @@ class GameWorkResult:
 def create_initial_population(
     num_agents: int,
     cfg: Config,
+    identical_models: bool = True,
 ) -> PopulationStore:
 
-    return PopulationStore.initialize(num_agents=num_agents, cfg=cfg)
+    return PopulationStore.initialize(
+        num_agents=num_agents,
+        cfg=cfg,
+        identical_models=identical_models,
+    )
 
 
 def sample_weekly_winners(

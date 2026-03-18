@@ -4,11 +4,11 @@ from pathlib import Path
 import torch
 
 from survivor_engine import (
-    all_agents,
     config,
+    create_initial_population,
     evo_loop,
     load_population_weights,
-    move_population_to_device,
+    num_agents,
     num_contestants,
     save_population_weights,
 )
@@ -80,9 +80,7 @@ if __name__ == "__main__":
     if args.game_workers is not None and args.game_workers < 1:
         raise ValueError("--game-workers must be >= 1 when provided.")
     dispatch_devices = resolve_dispatch_devices(args.device)
-    runtime_device = dispatch_devices[0]
 
-    population = list(all_agents)
     if args.load:
         weights_path = Path(args.weights_path)
         if weights_path.exists():
@@ -91,15 +89,17 @@ if __name__ == "__main__":
         else:
             print(f"Load requested but no checkpoint found at: {weights_path}")
             print("Starting from initialized population.")
-
-    population = move_population_to_device(population, runtime_device)
-    if len(dispatch_devices) == 1:
-        print(f"Using device: {runtime_device}")
+            population = create_initial_population(num_agents=num_agents, cfg=config)
     else:
-        print("Using devices: " + ", ".join(str(device) for device in dispatch_devices))
+        population = create_initial_population(num_agents=num_agents, cfg=config)
+
+    if len(dispatch_devices) == 1:
+        print(f"Dispatching games on device: {dispatch_devices[0]}")
+    else:
+        print("Dispatching games on devices: " + ", ".join(str(device) for device in dispatch_devices))
 
     evolved_population = evo_loop(
-        all_agents=population,
+        population=population,
         num_loops=args.num_loops,
         num_contestants=num_contestants,
         noise_std=args.noise_std,

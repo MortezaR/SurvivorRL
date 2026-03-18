@@ -20,6 +20,7 @@ def featurize(
     matchup_table: List[MatchupRow],   # [(week_id, team_id, win_prob), ...]
     agent_id: int,                     # contestant_id
     current_week: int,                 # current week index
+    num_players: [int],
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
@@ -38,6 +39,8 @@ def featurize(
     # If no device is provided, default to GPU.
     if device is None:
         device = torch.device("cuda")
+
+    num_players = torch.tensor(num_players, device=device, dtype=dtype)
 
     # 1) contestant pick features: [2, T]
     picks_mat = torch.zeros((PICKS_FEATURE_ROWS, T), device=device, dtype=dtype)
@@ -73,6 +76,7 @@ def featurize(
         picks_mat.flatten(),      # 2*T
         matchup_odds.flatten(),   # W*T
         current_week_oh.flatten(),   # W
+        num_players.flatten()
     ], dim=0)
 
     return x  # [D]
@@ -85,7 +89,7 @@ class PickerNet(nn.Module):
         self.input_dim = (
             (PICKS_FEATURE_ROWS * cfg.num_teams)
             + (cfg.num_weeks * cfg.num_teams)
-            + cfg.num_weeks
+            + cfg.num_weeks + 1
         )
         self.fc1 = nn.Linear(self.input_dim, 128)
         self.fc2 = nn.Linear(128, 128)
@@ -96,7 +100,8 @@ class PickerNet(nn.Module):
         contestant_picks: Dict[int, List[int]],
         matchup_table: List[MatchupRow],
         current_week: int,
-        unavailable_team_ids: Optional[List[int]] = None,
+        num_players: int,
+        unavailable_team_ids: List[int],
     ):
         model_device = self.fc1.weight.device
         model_dtype = self.fc1.weight.dtype
@@ -106,6 +111,7 @@ class PickerNet(nn.Module):
             matchup_table=matchup_table,
             agent_id=self.agent_id,
             current_week=current_week,
+            num_players=num_players,
             device=model_device,
             dtype=model_dtype,
         )

@@ -65,6 +65,7 @@ def survivor_game(
                     contestant_picks=contestant_picks_upto_last_week,
                     matchup_table=mu_table,
                     current_week=week_idx,
+                    num_players=len(active_agents),
                     unavailable_team_ids=prior_picks,
                 )
                 picked_team_id = int(torch.multinomial(pick_dist, num_samples=1).item())

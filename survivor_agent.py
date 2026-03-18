@@ -12,7 +12,7 @@ class Config:
     num_weeks: int
 
 MatchupRow = Tuple[int, int, float]  # (week_id, team_id, win_probability)
-PICKS_CONTESTANT_CAP = 100
+PICKS_FEATURE_ROWS = 2
 
 def featurize(
     cfg: Config,
@@ -20,6 +20,7 @@ def featurize(
     matchup_table: List[MatchupRow],   # [(week_id, team_id, win_prob), ...]
     agent_id: int,                     # contestant_id
     current_week: int,                 # current week index
+    num_players: [int],
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
@@ -27,34 +28,33 @@ def featurize(
     Returns a single feature vector x: [D]
 
     Encodes:
-      1) picks_mat: [100, T] one-hot picks of active contestants (capped),
-         with row 0 always reserved for this agent
+      1) picks_mat: [2, T]
+         - row 0: one-hot picks for this agent
+         - row 1: elementwise average of one-hot picks for all other active agents
       2) matchup_odds: [W, T] week x team win probabilities
       3) current_week: [W] one-hot current week
     """
-    C, T, W = cfg.num_contestants, cfg.num_teams, cfg.num_weeks
+    T, W = cfg.num_teams, cfg.num_weeks
 
     # If no device is provided, default to GPU.
     if device is None:
         device = torch.device("cuda")
 
-    # 1) contestant->picked team matrix: [100, T]
-    # If contestants exceed cap, leave picks input as zeros.
-    picks_mat = torch.zeros((PICKS_CONTESTANT_CAP, T), device=device, dtype=dtype)
+    num_players = torch.tensor(num_players, device=device, dtype=dtype)
+
+    # 1) contestant pick features: [2, T]
+    picks_mat = torch.zeros((PICKS_FEATURE_ROWS, T), device=device, dtype=dtype)
     # Row 0 is always this agent.
     self_picks = contestant_picks.get(agent_id, [])
     for tid in self_picks:
         picks_mat[0, tid] = 1.0
 
-    if C <= PICKS_CONTESTANT_CAP:
-        max_rows = C
-        # Remaining rows are other contestants in stable id order.
-        other_ids = sorted(cid for cid in contestant_picks.keys())
-        row = 1
+    other_ids = [cid for cid in contestant_picks.keys() if cid != agent_id]
+    if other_ids:
         for cid in other_ids:
             for tid in contestant_picks[cid]:
-                picks_mat[row, tid] = 1.0
-            row += 1
+                picks_mat[1, tid] += 1.0
+        picks_mat[1] /= len(other_ids)
 
     # 2) matchup odds table: [W, T]
     matchup_odds = torch.zeros((W, T), device=device, dtype=dtype)
@@ -73,9 +73,10 @@ def featurize(
 
     # Flatten into one vector
     x = torch.cat([
-        picks_mat.flatten(),      # 100*T
+        picks_mat.flatten(),      # 2*T
         matchup_odds.flatten(),   # W*T
         current_week_oh.flatten(),   # W
+        num_players.flatten()
     ], dim=0)
 
     return x  # [D]
@@ -86,9 +87,9 @@ class PickerNet(nn.Module):
         self.agent_id = agent_id
         self.cfg = cfg
         self.input_dim = (
-            (PICKS_CONTESTANT_CAP * cfg.num_teams)
+            (PICKS_FEATURE_ROWS * cfg.num_teams)
             + (cfg.num_weeks * cfg.num_teams)
-            + cfg.num_weeks
+            + cfg.num_weeks + 1
         )
         self.fc1 = nn.Linear(self.input_dim, 128)
         self.fc2 = nn.Linear(128, 128)
@@ -99,7 +100,8 @@ class PickerNet(nn.Module):
         contestant_picks: Dict[int, List[int]],
         matchup_table: List[MatchupRow],
         current_week: int,
-        unavailable_team_ids: Optional[List[int]] = None,
+        num_players: int,
+        unavailable_team_ids: List[int],
     ):
         model_device = self.fc1.weight.device
         model_dtype = self.fc1.weight.dtype
@@ -109,6 +111,7 @@ class PickerNet(nn.Module):
             matchup_table=matchup_table,
             agent_id=self.agent_id,
             current_week=current_week,
+            num_players=num_players,
             device=model_device,
             dtype=model_dtype,
         )

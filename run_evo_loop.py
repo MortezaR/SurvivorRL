@@ -1,5 +1,11 @@
 import argparse
+import os
 from pathlib import Path
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import torch
 
@@ -43,6 +49,13 @@ def resolve_dispatch_devices(device_arg: str) -> list[torch.device]:
 
 
 if __name__ == "__main__":
+    torch.set_num_threads(1)
+    if hasattr(torch, "set_num_interop_threads"):
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+
     parser = argparse.ArgumentParser(description="Run SurvivorRL evolution loop.")
     parser.add_argument("--num-loops", type=int, default=10)
     parser.add_argument("--noise-std", type=float, default=0.01)

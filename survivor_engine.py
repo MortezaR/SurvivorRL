@@ -19,7 +19,7 @@ from survivor_agent import (
 )
 from survivor_schedule import load_schedule_from_csv
 
-num_agents = 500000
+num_agents = 50000
 num_contestants = 10
 num_weeks = 18
 num_teams = 32

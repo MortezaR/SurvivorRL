@@ -728,6 +728,8 @@ def evo_loop(
     noise_std: float = 0.01,
     game_workers: Optional[int] = None,
     dispatch_devices: Optional[List[torch.device]] = None,
+    checkpoint_every: Optional[int] = None,
+    checkpoint_path: Optional[str] = None,
 ) -> PopulationStore:
 
     if num_contestants <= 0:
@@ -736,6 +738,10 @@ def evo_loop(
         raise ValueError("game_workers must be >= 1 when provided.")
     if dispatch_devices is not None and not dispatch_devices:
         raise ValueError("dispatch_devices must not be empty when provided.")
+    if checkpoint_every is not None and checkpoint_every < 1:
+        raise ValueError("checkpoint_every must be >= 1 when provided.")
+    if checkpoint_path is not None and checkpoint_every is None:
+        raise ValueError("checkpoint_path requires checkpoint_every to be set.")
 
     def _run_loop(current_population: PopulationStore) -> PopulationStore:
         devices = (
@@ -781,6 +787,16 @@ def evo_loop(
                     f"Loop {loop_idx + 1}/{num_loops} average game length: "
                     f"{avg_week_length:.2f} weeks"
                 )
+                if (
+                    checkpoint_every is not None
+                    and checkpoint_path is not None
+                    and (loop_idx + 1) % checkpoint_every == 0
+                ):
+                    save_population_weights(current_population, checkpoint_path)
+                    print(
+                        f"Checkpoint saved at generation {loop_idx + 1}: "
+                        f"{checkpoint_path}"
+                    )
 
             return current_population
         finally:

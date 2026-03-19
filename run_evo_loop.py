@@ -19,6 +19,8 @@ from survivor_engine import (
     save_population_weights,
 )
 
+CHECKPOINT_EVERY_GENERATIONS = 10
+
 
 def resolve_dispatch_devices(device_arg: str) -> list[torch.device]:
     if device_arg == "cpu":
@@ -118,10 +120,14 @@ if __name__ == "__main__":
         noise_std=args.noise_std,
         game_workers=args.game_workers,
         dispatch_devices=dispatch_devices,
+        checkpoint_every=CHECKPOINT_EVERY_GENERATIONS if args.save else None,
+        checkpoint_path=args.weights_path if args.save else None,
     )
     print(f"Finished {args.num_loops} evo loop(s).")
     print(f"Population size: {len(evolved_population)}")
 
-    if args.save:
+    if args.save and (
+        args.num_loops == 0 or args.num_loops % CHECKPOINT_EVERY_GENERATIONS != 0
+    ):
         save_population_weights(evolved_population, args.weights_path)
         print(f"Saved population to: {args.weights_path}")

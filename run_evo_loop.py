@@ -86,7 +86,7 @@ if __name__ == "__main__":
         "--game-workers",
         type=int,
         default=None,
-        help="Number of active device workers. Defaults to one per device; values above device count are capped.",
+        help="Number of games each GPU should process per dispatch round. Defaults to 1.",
     )
     args = parser.parse_args()
 

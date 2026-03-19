@@ -598,17 +598,15 @@ class GameDispatcher:
     def __init__(
         self,
         devices: List[torch.device],
-        max_workers: Optional[int] = None,
+        games_per_device: Optional[int] = None,
     ) -> None:
 
         if not devices:
             raise ValueError("GameDispatcher requires at least one dispatch device.")
         self.devices = [torch.device(device) for device in devices]
-        default_workers = len(self.devices)
-        requested_workers = default_workers if max_workers is None else max_workers
-        self.max_workers = max(1, min(requested_workers, len(self.devices)))
+        self.games_per_device = 1 if games_per_device is None else max(1, games_per_device)
         self._executor = ThreadPoolExecutor(
-            max_workers=self.max_workers,
+            max_workers=len(self.devices),
             thread_name_prefix="game-dispatcher",
         )
 
@@ -624,12 +622,6 @@ class GameDispatcher:
         if not work_items:
             return PopulationStore.empty(population.cfg), []
 
-        active_device_count = min(self.max_workers, len(work_items))
-        active_devices = self.devices[:active_device_count]
-        work_queues: List[List[GameWorkItem]] = [[] for _ in range(active_device_count)]
-        for queue_idx, work_item in enumerate(work_items):
-            work_queues[queue_idx % active_device_count].append(work_item)
-
         total_output_agents = len(work_items) * num_contestants
         next_parameter_tensors = {
             name: torch.empty(
@@ -640,53 +632,77 @@ class GameDispatcher:
         }
         next_agent_ids = torch.empty(total_output_agents, dtype=torch.long)
         game_week_lengths = [0] * len(work_items)
-        result_queue: Queue = Queue()
-
-        futures = [
-            self._executor.submit(
-                _run_device_work_queue,
-                active_devices[device_idx],
-                work_queues[device_idx],
-                population,
-                num_contestants,
-                noise_std,
-                result_queue,
-            )
-            for device_idx in range(active_device_count)
-        ]
         generation = tqdm(total=len(work_items), desc=desc, leave=False)
 
         try:
             completed_results = 0
-            while completed_results < len(work_items):
-                try:
-                    result = result_queue.get(timeout=0.1)
-                except Empty:
-                    for future in futures:
-                        if future.done():
-                            exc = future.exception()
-                            if exc is not None:
-                                for pending_future in futures:
-                                    pending_future.cancel()
-                                raise exc
-                    continue
+            next_game_idx = 0
 
-                start = result.game_idx * num_contestants
-                shard_size = len(result.population_shard)
-                end = start + shard_size
+            while next_game_idx < len(work_items):
+                remaining_games = len(work_items) - next_game_idx
+                active_device_count = min(
+                    len(self.devices),
+                    max(1, (remaining_games + self.games_per_device - 1) // self.games_per_device),
+                )
+                active_devices = self.devices[:active_device_count]
+                result_queue: Queue = Queue()
+                round_work_queues: List[List[GameWorkItem]] = []
 
-                for name, tensor in result.population_shard.parameter_tensors.items():
-                    next_parameter_tensors[name][start:end].copy_(tensor)
-                next_agent_ids[start:end].copy_(result.population_shard.agent_ids)
-                game_week_lengths[result.game_idx] = result.weeks_played
-                completed_results += 1
-                generation.update(1)
+                for device_offset in range(active_device_count):
+                    queue_start = next_game_idx + (device_offset * self.games_per_device)
+                    queue_end = min(
+                        queue_start + self.games_per_device,
+                        len(work_items),
+                    )
+                    round_work_queues.append(work_items[queue_start:queue_end])
 
-            for future in futures:
-                future.result()
+                futures = [
+                    self._executor.submit(
+                        _run_device_work_queue,
+                        active_devices[device_idx],
+                        round_work_queues[device_idx],
+                        population,
+                        num_contestants,
+                        noise_std,
+                        result_queue,
+                    )
+                    for device_idx in range(active_device_count)
+                    if round_work_queues[device_idx]
+                ]
+
+                round_game_count = sum(len(queue) for queue in round_work_queues)
+                round_results = 0
+
+                while round_results < round_game_count:
+                    try:
+                        result = result_queue.get(timeout=0.1)
+                    except Empty:
+                        for future in futures:
+                            if future.done():
+                                exc = future.exception()
+                                if exc is not None:
+                                    for pending_future in futures:
+                                        pending_future.cancel()
+                                    raise exc
+                        continue
+
+                    start = result.game_idx * num_contestants
+                    shard_size = len(result.population_shard)
+                    end = start + shard_size
+
+                    for name, tensor in result.population_shard.parameter_tensors.items():
+                        next_parameter_tensors[name][start:end].copy_(tensor)
+                    next_agent_ids[start:end].copy_(result.population_shard.agent_ids)
+                    game_week_lengths[result.game_idx] = result.weeks_played
+                    completed_results += 1
+                    round_results += 1
+                    generation.update(1)
+
+                for future in futures:
+                    future.result()
+
+                next_game_idx += round_game_count
         except Exception:
-            for future in futures:
-                future.cancel()
             raise
         finally:
             generation.close()
@@ -729,7 +745,7 @@ def evo_loop(
         )
         dispatcher = GameDispatcher(
             devices=devices,
-            max_workers=game_workers,
+            games_per_device=game_workers,
         )
         try:
             loop_iter = tqdm(range(num_loops), desc="Evo loops")

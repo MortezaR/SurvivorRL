@@ -90,7 +90,7 @@ if __name__ == "__main__":
         default=EARLY_CPU_THREADS,
         help="Number of CPU math threads to use for BLAS/OpenMP and PyTorch intra-op work.",
     )
-    parser.add_argument("--noise-std", type=float, default=0.01)
+    parser.add_argument("--noise-std", type=float, default=0.1)
     parser.add_argument(
         "--load",
         action=argparse.BooleanOptionalAction,

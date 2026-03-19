@@ -73,7 +73,7 @@ if __name__ == "__main__":
         "--game-workers",
         type=int,
         default=None,
-        help="Number of concurrent game workers. Defaults to 2 per CUDA device and 1 on CPU.",
+        help="Number of active device workers. Defaults to one per device; values above device count are capped.",
     )
     args = parser.parse_args()
 

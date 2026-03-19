@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Queue
 import random
 from typing import Dict, List, Optional, Tuple
 
@@ -572,6 +573,27 @@ def _run_game_work_item(
     )
 
 
+def _run_device_work_queue(
+    device: torch.device,
+    assigned_work_items: List[GameWorkItem],
+    population: PopulationStore,
+    num_contestants: int,
+    noise_std: float,
+    result_queue: Queue,
+) -> None:
+
+    for work_item in assigned_work_items:
+        result_queue.put(
+            _run_game_work_item(
+                work_item=work_item,
+                population=population,
+                num_contestants=num_contestants,
+                noise_std=noise_std,
+                device=device,
+            )
+        )
+
+
 class GameDispatcher:
     def __init__(
         self,
@@ -582,9 +604,9 @@ class GameDispatcher:
         if not devices:
             raise ValueError("GameDispatcher requires at least one dispatch device.")
         self.devices = [torch.device(device) for device in devices]
-        has_cuda = any(device.type == "cuda" for device in self.devices)
-        default_workers = 2 * len(self.devices) if has_cuda else 1
-        self.max_workers = default_workers if max_workers is None else max_workers
+        default_workers = len(self.devices)
+        requested_workers = default_workers if max_workers is None else max_workers
+        self.max_workers = max(1, min(requested_workers, len(self.devices)))
         self._executor = ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix="game-dispatcher",
@@ -602,6 +624,12 @@ class GameDispatcher:
         if not work_items:
             return PopulationStore.empty(population.cfg), []
 
+        active_device_count = min(self.max_workers, len(work_items))
+        active_devices = self.devices[:active_device_count]
+        work_queues: List[List[GameWorkItem]] = [[] for _ in range(active_device_count)]
+        for queue_idx, work_item in enumerate(work_items):
+            work_queues[queue_idx % active_device_count].append(work_item)
+
         total_output_agents = len(work_items) * num_contestants
         next_parameter_tensors = {
             name: torch.empty(
@@ -612,23 +640,37 @@ class GameDispatcher:
         }
         next_agent_ids = torch.empty(total_output_agents, dtype=torch.long)
         game_week_lengths = [0] * len(work_items)
+        result_queue: Queue = Queue()
 
         futures = [
             self._executor.submit(
-                _run_game_work_item,
-                work_item,
+                _run_device_work_queue,
+                active_devices[device_idx],
+                work_queues[device_idx],
                 population,
                 num_contestants,
                 noise_std,
-                self.devices[work_item.game_idx % len(self.devices)],
+                result_queue,
             )
-            for work_item in work_items
+            for device_idx in range(active_device_count)
         ]
-        generation = tqdm(total=len(futures), desc=desc, leave=False)
+        generation = tqdm(total=len(work_items), desc=desc, leave=False)
 
         try:
-            for future in as_completed(futures):
-                result = future.result()
+            completed_results = 0
+            while completed_results < len(work_items):
+                try:
+                    result = result_queue.get(timeout=0.1)
+                except Empty:
+                    for future in futures:
+                        if future.done():
+                            exc = future.exception()
+                            if exc is not None:
+                                for pending_future in futures:
+                                    pending_future.cancel()
+                                raise exc
+                    continue
+
                 start = result.game_idx * num_contestants
                 shard_size = len(result.population_shard)
                 end = start + shard_size
@@ -637,7 +679,11 @@ class GameDispatcher:
                     next_parameter_tensors[name][start:end].copy_(tensor)
                 next_agent_ids[start:end].copy_(result.population_shard.agent_ids)
                 game_week_lengths[result.game_idx] = result.weeks_played
+                completed_results += 1
                 generation.update(1)
+
+            for future in futures:
+                future.result()
         except Exception:
             for future in futures:
                 future.cancel()

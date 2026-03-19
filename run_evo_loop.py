@@ -1,11 +1,42 @@
 import argparse
 import os
 from pathlib import Path
+import sys
 
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+def resolve_cpu_threads(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--cpu-threads", type=int)
+    args, _ = parser.parse_known_args(argv[1:])
+
+    if args.cpu_threads is not None:
+        return max(1, args.cpu_threads)
+
+    for env_name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        raw_value = os.environ.get(env_name)
+        if raw_value is None:
+            continue
+        try:
+            return max(1, int(raw_value))
+        except ValueError:
+            continue
+
+    return 1
+
+
+EARLY_CPU_THREADS = resolve_cpu_threads(sys.argv)
+for env_name in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ[env_name] = str(EARLY_CPU_THREADS)
 
 import torch
 
@@ -51,15 +82,14 @@ def resolve_dispatch_devices(device_arg: str) -> list[torch.device]:
 
 
 if __name__ == "__main__":
-    torch.set_num_threads(1)
-    if hasattr(torch, "set_num_interop_threads"):
-        try:
-            torch.set_num_interop_threads(1)
-        except RuntimeError:
-            pass
-
     parser = argparse.ArgumentParser(description="Run SurvivorRL evolution loop.")
     parser.add_argument("--num-loops", type=int, default=10)
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=EARLY_CPU_THREADS,
+        help="Number of CPU math threads to use for BLAS/OpenMP and PyTorch intra-op work.",
+    )
     parser.add_argument("--noise-std", type=float, default=0.01)
     parser.add_argument(
         "--load",
@@ -92,8 +122,18 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    if args.cpu_threads < 1:
+        raise ValueError("--cpu-threads must be >= 1 when provided.")
     if args.game_workers is not None and args.game_workers < 1:
         raise ValueError("--game-workers must be >= 1 when provided.")
+
+    torch.set_num_threads(args.cpu_threads)
+    if hasattr(torch, "set_num_interop_threads"):
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+
     dispatch_devices = resolve_dispatch_devices(args.device)
 
     if args.load:

@@ -597,10 +597,21 @@ class GameDispatcher:
         num_contestants: int,
         noise_std: float,
         desc: str,
-    ) -> List[GameWorkResult]:
+    ) -> Tuple[PopulationStore, List[int]]:
 
         if not work_items:
-            return []
+            return PopulationStore.empty(population.cfg), []
+
+        total_output_agents = len(work_items) * num_contestants
+        next_parameter_tensors = {
+            name: torch.empty(
+                (total_output_agents, *tensor.shape[1:]),
+                dtype=tensor.dtype,
+            )
+            for name, tensor in population.parameter_tensors.items()
+        }
+        next_agent_ids = torch.empty(total_output_agents, dtype=torch.long)
+        game_week_lengths = [0] * len(work_items)
 
         futures = [
             self._executor.submit(
@@ -613,13 +624,19 @@ class GameDispatcher:
             )
             for work_item in work_items
         ]
-        ordered_results: List[Optional[GameWorkResult]] = [None] * len(work_items)
         generation = tqdm(total=len(futures), desc=desc, leave=False)
 
         try:
             for future in as_completed(futures):
                 result = future.result()
-                ordered_results[result.game_idx] = result
+                start = result.game_idx * num_contestants
+                shard_size = len(result.population_shard)
+                end = start + shard_size
+
+                for name, tensor in result.population_shard.parameter_tensors.items():
+                    next_parameter_tensors[name][start:end].copy_(tensor)
+                next_agent_ids[start:end].copy_(result.population_shard.agent_ids)
+                game_week_lengths[result.game_idx] = result.weeks_played
                 generation.update(1)
         except Exception:
             for future in futures:
@@ -628,7 +645,14 @@ class GameDispatcher:
         finally:
             generation.close()
 
-        return [result for result in ordered_results if result is not None]
+        return (
+            PopulationStore(
+                cfg=population.cfg,
+                parameter_tensors=next_parameter_tensors,
+                agent_ids=next_agent_ids,
+            ),
+            game_week_lengths,
+        )
 
     def close(self) -> None:
 
@@ -679,7 +703,7 @@ def evo_loop(
                         )
                     )
 
-                results = dispatcher.run_generation(
+                next_population, game_week_lengths = dispatcher.run_generation(
                     population=current_population,
                     work_items=work_items,
                     num_contestants=num_contestants,
@@ -687,11 +711,7 @@ def evo_loop(
                     desc=f"Loop {loop_idx + 1}/{num_loops} generation",
                 )
 
-                game_week_lengths = [result.weeks_played for result in results]
-                current_population = PopulationStore.concatenate(
-                    [result.population_shard for result in results],
-                    cfg=current_population.cfg,
-                )
+                current_population = next_population
                 current_population.reset_agent_ids()
 
                 avg_week_length = sum(game_week_lengths) / len(game_week_lengths)
